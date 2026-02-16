@@ -38,6 +38,8 @@ from itertools import chain
 from textwrap import TextWrapper
 
 import constants as co
+from utilities import Frcmod
+from data_structs import FF, AmberFF
 
 logging.config.dictConfig(co.LOG_SETTINGS)
 logger = logging.getLogger(__file__)
@@ -101,14 +103,21 @@ class ParallelCalculator(ABC):
 #TODO: MF - calculate kept separate from gather_results bc, when running in parallel, might want to start calculations but not gather them until they have completed
 # however, likely that we will do both in one go bc running multiple candidate FFs in the same folder for a single round, if so then just merge into one method
 
+# Have the HO just pass the set of particles and their coordinates to the swarm optimizer
+# swarm optimizer then pops these back to a set of FF data objects,
+# these then get passed to the Calculator which updates the respective files, rewriting them
+# Calculator then initializes or continues a pool of workers which run the files
+# Once all calculations/scripts complete, the Calculator then retrieves the results from the files
+# Swarm optimizer or optimizer then runs the compare and returns the scores to the HO
+
 class AmberCalculator(Calculator):
 
-    def __init__(self):
+    def __init__(self, frcmod:Frcmod):
         super(Calculator, self).__init__()
         self.sub_names = []
         self._atom_types = None
         self._lines = None
-        self.ff = None
+        self.frcmod = frcmod
         # 3 options, this paradigm should be established in the superclass:
         # ^ this is a data object classed in data_structs, when changed AmberCalculator will create a file instance and write out the new ff
         # a 3rd option is to have this be a list of FFs, have it manage the calc_# directories and pool and just reuse the same .in etc, this might be best although I like the idea of a calculator per thread
@@ -120,7 +129,22 @@ class AmberCalculator(Calculator):
         co.STEPS["af"] = 10.0
         co.STEPS["df"] = 10.0
 
-    def update_topology(self):
+    #FF property which will write a new forcefield when it is updated, automatically
+
+    def write_scripts(self):
+        #write scripts for analysis
+        return
+
+    def update_ff(self, ff:AmberFF):
+        self.frcmod.force_field = ff
+        self.update_topology()
+
+    def update_topology(self): # TODO frcmod file should already be updated and written, but perhaps we have a stale flag to ensure it is re-written if not
+        
+        # delete existing prmtop so that it will not use pre-existing one if the leap script fails
+        # make and write leap input file if doesn't already exist, confirm that leap input file FF property is correct, matches this one's, run leap input
+        # confirm that prmtop and inpcrd exist
+
         return
 
     def calculate_geometry(self): # TODO I don't see why this can't encapsulate bonds, angles, torsions...
@@ -138,5 +162,5 @@ class AmberCalculator(Calculator):
 
         return
     
-    def gather_results(self): # replaces collect_data, effectively
+    def gather_results(self): # replaces collect_data, effectively; calls file io to return data structs of results
         return

@@ -1116,6 +1116,7 @@ class Frcmod(File):
         self.sub_names = []
         self._atom_types = None
         self._lines = None
+        self.force_field:AmberFF = None
         # change constant
         co.STEPS["bf"] = 10.00
         co.STEPS["af"] = 10.0
@@ -1394,6 +1395,14 @@ class Frcmod(File):
     
     def get_DOFs_by_param(self, structs:List[Structure]) -> dict:
         return self.get_DOFs_by_atom_type(structs)
+    
+class AmberLeapInput(File):
+    def __init__(self, path: str, frcmod:Frcmod):
+        super(File, self).__init__(path)
+        self.frcmod = frcmod
+
+    def write_in_file(self):
+        return
 
 # Currently only for 1 system.
 # Note: It comes in mass-weighted kcal/mol (A?), then gets converted to kJ/mol but nothing else
