@@ -6,7 +6,7 @@ from abc import abstractmethod
 import logging
 import logging.config
 from string import digits
-from typing import List
+from typing import List, Tuple
 import numpy as np
 import os
 import re
@@ -587,7 +587,7 @@ class Structure(object):
                     directly depend on our parameters.
         """
         data = []
-        logger.log(1, ">>> typ: {}".format(typ))
+        logger.log(logging.DEBUG, ">>> typ: {}".format(typ))
         for thing in getattr(self, typ):
             if (
                 com_match and any(x in thing.comment for x in com_match)
@@ -608,7 +608,7 @@ class Structure(object):
                             angle_2 = angle.value
                             break
                     try:
-                        logger.log(1, ">>> atom_nums: {}".format(atom_nums))
+                        logger.log(logging.DEBUG, ">>> atom_nums: {}".format(atom_nums))
                         logger.log(
                             1, ">>> angle_1: {} / angle_2: {}".format(angle_1, angle_2)
                         )
@@ -643,7 +643,7 @@ class Structure(object):
                     #     atom_coords[0], atom_coords[1], atom_coords[2])
                     # tor_2 = geo_from_points(
                     #     atom_coords[1], atom_coords[2], atom_coords[3])
-                    # logger.log(1, '>>> tor_1: {} / tor_2: {}'.format(
+                    # logger.log(logging.DEBUG, '>>> tor_1: {} / tor_2: {}'.format(
                     #     tor_1, tor_2))
                     # if -5. < tor_1 < 5. or 175. < tor_1 < 185. or \
                     #         -5. < tor_2 < 5. or 175. < tor_2 < 185.:
@@ -684,7 +684,7 @@ class Structure(object):
         dummies = []
         for atom in self._atoms:
             if atom.is_dummy:
-                logger.log(10, "  -- Identified {} as a dummy atom.".format(atom))
+                logger.log(logging.DEBUG, "  -- Identified {} as a dummy atom.".format(atom))
                 dummies.append(atom.index)
         return dummies
 
@@ -861,7 +861,7 @@ class Param(object):
             ptype (_type_, optional): Parameter type {'ae', 'af', 'be', 'bf', 'df', 'imp1', 'imp2', 'sb', 'q'}. Defaults to None.
             value (float, optional): Value of the parameter. Defaults to None.
         """
-        self._allowed_range = None
+        self._allowed_range:Tuple[float, float] = None
         self._step = None
         self._value = None
         self.d1 = d1
@@ -874,7 +874,7 @@ class Param(object):
         return "{}[{}]({:7.4f})".format(self.__class__.__name__, self.ptype, self.value)
 
     @property
-    def allowed_range(self) -> List[float]:
+    def allowed_range(self) -> Tuple[float, float]:
         """Returns the allowed range of values for the parameter based on its parameter type (ptype).
 
         Returns:
@@ -882,9 +882,9 @@ class Param(object):
         """
         if self._allowed_range is None and self.ptype is not None:
             if self.ptype in ["q", "df"]:
-                self._allowed_range = [-float("inf"), float("inf")]
+                self._allowed_range = (-float("inf"), float("inf"))
             else:
-                self._allowed_range = [0.0, float("inf")]
+                self._allowed_range = (0.0, float("inf"))
         return self._allowed_range
 
     @property
@@ -1065,6 +1065,18 @@ class FF(object):
 
     def __repr__(self):
         return "{}[{}]({})".format(self.__class__.__name__, self.method, self.score)
+    
+    def set_param_values(self,values):
+        for i, param in enumerate(self.params):
+            param.value = values[i]
+    
+    def to_coords(self) -> np.ndarray:
+        coords = np.array([par.value for par in self.params]) #TODO finish
+        return coords
+    
+    def get_bounds(self) -> np.ndarray:
+        bounds = np.array([par.allowed_range for par in self.params])
+        return bounds
 
     @abstractmethod
     def get_DOFs_by_param(self, structs: List[Structure]) -> dict:
@@ -1168,7 +1180,7 @@ class AmberFF(FF):
         self.sub_names = []
         count = 0
         with open(path, "r") as f:
-            logger.log(15, "READING: {}".format(path))
+            logger.log(logging.DEBUG, "READING: {}".format(path))
             for i, line in enumerate(f):
                 split = line.split()
                 if not q2mm_sec and "# Q2MM" in line:
@@ -1314,7 +1326,7 @@ class AmberFF(FF):
                                 value=float(split[2]),
                             )
                         )
-        logger.log(15, "  -- Read {} parameters.".format(len(self.params)))
+        logger.log(logging.DEBUG, "  -- Read {} parameters.".format(len(self.params)))
 
     def export_ff(self, path=None, params: List[ParAMBER] = None, lines=None):
         """
@@ -1327,7 +1339,7 @@ class AmberFF(FF):
         if lines is None:
             lines = self.lines
         for param in params:
-            logger.log(1, ">>> param: {} param.value: {}".format(param, param.value))
+            logger.log(logging.DEBUG, ">>> param: {} param.value: {}".format(param, param.value))
             line = lines[param.ff_row - 1]
             if abs(param.value) > 1999.0:
                 logger.warning("Value of {} is too high! Skipping write.".format(param))
@@ -1385,7 +1397,7 @@ class AmberFF(FF):
                 lines[param.ff_row - 1] = atoms + const + "\n"
         with open(path, "w") as f:
             f.writelines(lines)
-        logger.log(10, "WROTE: {}".format(path))
+        logger.log(logging.DEBUG, "WROTE: {}".format(path))
 
     def get_DOFs_by_atom_type(self, structs: List[Structure]) -> dict:
         dof_by_param = dict()
@@ -1406,5 +1418,3 @@ class AmberFF(FF):
 
 
 # endregion AMBER
-
-# endregion

@@ -151,8 +151,8 @@ def replace_minimum(array, value=1):
     logger.log(logging.INFO,"max eval: "+str(array.max()))
     # Sometimes we use 1, but sometimes we use co.HESSIAN_CONVERSION.
     array[minimum_index] = value
-    logger.log(1, '>>> minimum_index: {}'.format(minimum_index))
-    logger.log(1, '>>> array:\n{}'.format(array))
+    logger.log(logging.DEBUG, '>>> minimum_index: {}'.format(minimum_index))
+    logger.log(logging.DEBUG, '>>> array:\n{}'.format(array))
     logger.log(logging.INFO, '  -- Replaced minimum in array with {}.'.format(value))
 
 #region File I/O
@@ -727,8 +727,8 @@ class GaussLog(File):
                     evec[i] *= element
             self._evals = np.array(self._evals)
             self._evecs = np.array(self._evecs)
-            logger.log(1, ">>> self._evals: {}".format(self._evals))
-            logger.log(1, ">>> self._evecs: {}".format(self._evecs))
+            logger.log(logging.DEBUG, ">>> self._evals: {}".format(self._evals))
+            logger.log(logging.DEBUG, ">>> self._evecs: {}".format(self._evecs))
             logger.log(5, "  -- {} structures found.".format(len(self.structures)))
 
     # May want to move some attributes assigned to the structure class onto
@@ -834,7 +834,7 @@ class GaussLog(File):
                 # raise Exception(
                 #     'Not sure how to read coordinates from Gaussian archive!')
             struct._atoms.append(Atom(element=ele, x=float(x), y=float(y), z=float(z)))
-        logger.log(20, "  -- Read {} atoms.".format(len(struct._atoms)))
+        logger.log(logging.INFO, "  -- Read {} atoms.".format(len(struct._atoms)))
         # SECTION 4
         # All sorts of information here. This area looks like:
         #     prop1=value1\prop2=value2\prop3=value3
@@ -898,7 +898,7 @@ class GaussLog(File):
             if len(yes_or_no) == 4:
                 structures_compared += 1
                 if best_structure is None:
-                    logger.log(10, "  -- Most converged structure: {}".format(i + 1))
+                    logger.log(logging.DEBUG, "  -- Most converged structure: {}".format(i + 1))
                     best_structure = structure
                     best_yes_or_no = yes_or_no
                 elif yes_or_no.count("YES") > best_yes_or_no.count("YES"):
@@ -937,7 +937,7 @@ class GaussLog(File):
                       to be overwritten by whatever comes later in the
                       log file.
         """
-        logger.log(10, "READING: {}".format(self.filename))
+        logger.log(logging.DEBUG, "READING: {}".format(self.filename))
         structures = []
         with open(self.path, "r") as f:
             section_coords_input = False
@@ -1159,7 +1159,7 @@ class Frcmod(File):
         self.sub_names = []
         count = 0
         with open(path, "r") as f:
-            logger.log(15, "READING: {}".format(path))
+            logger.log(logging.DEBUG, "READING: {}".format(path))
             for i, line in enumerate(f):
                 split = line.split()
                 if not q2mm_sec and "# Q2MM" in line:
@@ -1305,7 +1305,8 @@ class Frcmod(File):
                                 value=float(split[2]),
                             )
                         )
-        logger.log(15, "  -- Read {} parameters.".format(len(self.params)))
+        logger.log(logging.DEBUG, "  -- Read {} parameters.".format(len(self.params)))
+        self.ff:AmberFF = AmberFF(self.path, data=None)
 
     def export_ff(self, path=None, params:List[ParAMBER]=None, lines=None):
         #TODO: MF change this such that it takes in an AmberFF and the AmberFF contains the params, the Frcmod makes/stores the lines
@@ -1320,7 +1321,7 @@ class Frcmod(File):
         if lines is None:
             lines = self.lines
         for param in params:
-            logger.log(1, ">>> param: {} param.value: {}".format(param, param.value))
+            logger.log(logging.DEBUG, ">>> param: {} param.value: {}".format(param, param.value))
             line = lines[param.ff_row - 1]
             if abs(param.value) > 1999.0:
                 logger.warning("Value of {} is too high! Skipping write.".format(param)) #TODO: MF - KK wrote this, no clue why he needed it bc should be using allowed_range
@@ -1378,7 +1379,7 @@ class Frcmod(File):
                 lines[param.ff_row - 1] = atoms + const + "\n"
         with open(path, "w") as f:
             f.writelines(lines)
-        logger.log(10, "WROTE: {}".format(path))
+        logger.log(logging.DEBUG, "WROTE: {}".format(path))
 
     def get_DOFs_by_atom_type(self, structs:List[Structure]) -> dict:
         dof_by_param = dict()
@@ -1414,7 +1415,7 @@ class AmberHess(File):
     @property
     def hessian(self):
         if self._hessian is None:
-            logger.log(10, 'READING: {}'.format(self.filename))
+            logger.log(logging.DEBUG, 'READING: {}'.format(self.filename))
             with open("./calc/"+self.filename, 'r') as f:
                 lines = f.readlines()
             for i,line in enumerate(lines):
@@ -1454,7 +1455,7 @@ class AmberEne(File):
     @property
     def structures(self):
         if self._structures == None:
-            logger.log(10, 'READING: {}'.format(self.filename))
+            logger.log(logging.DEBUG, 'READING: {}'.format(self.filename))
             self._structures = []
             flag = 0
             with open('./calc/'+self.filename, 'r') as f:
@@ -1509,7 +1510,7 @@ class AmberGeo(File):
     @property
     def structures(self):
         if self._structures == None:
-            logger.log(10, 'READING: {}'.format(self.filename))
+            logger.log(logging.DEBUG, 'READING: {}'.format(self.filename))
             self._structures = []
             with open("./calc/"+self.filename, 'r') as f:
                 sections = {'sp':1, 'minimization':2, 'hessian':2}
@@ -1661,7 +1662,7 @@ class AmberLeap_Gaus(File):
     @property
     def structures(self):
         if self._structures is None:
-            logger.log(10, 'READING: {}'.format(self.filename))
+            logger.log(logging.DEBUG, 'READING: {}'.format(self.filename))
             struct = Structure(self.filename)
             self._structures = [struct]
             with open(self.filename, 'r') as f:
@@ -1811,7 +1812,7 @@ exit
             os.remove('calc')
         sp.call("mkdir calc",shell=True, stderr=log, stdin=log, stdout=log)
         if com_opts['sp']:
-            logger.log(1, '  CALCULATE: {}'.format(self.filename))
+            logger.log(logging.DEBUG, '  CALCULATE: {}'.format(self.filename))
             # Run leap
             sp.call("tleap -f {}".format(self.filename),shell=True, stderr=log, stdin=log, stdout=log) # parm7 rst7 files made
             # Run Min
@@ -1869,7 +1870,7 @@ class AmberLeap(File):
     @property
     def structures(self):
         if self._structures is None:
-            logger.log(10, 'READING: {}'.format(self.filename))
+            logger.log(logging.DEBUG, 'READING: {}'.format(self.filename))
             struct = Structure(self.filename)
             self._structures = [struct]
             with open(self.filename, 'r') as f:
@@ -2139,7 +2140,7 @@ nmode( x, 3*m.natoms, mme2, 0, 0, 0.0, 0.0, 0);""".format(self.name)
         log = open(self.name_log,'w')
         sp.call("mkdir calc",shell=True, stderr=log, stdin=log, stdout=log)
         if com_opts['opt']:
-            logger.log(1, '  MINIMIZE & ANALYZE: {}'.format(self.filename))
+            logger.log(logging.DEBUG, '  MINIMIZE & ANALYZE: {}'.format(self.filename))
             # Run leap
             sp.call("tleap -f {}".format(self.filename),shell=True, stderr=log, stdin=log, stdout=log) # parm7 rst7 files made
             # Run Min
@@ -2149,7 +2150,7 @@ nmode( x, 3*m.natoms, mme2, 0, 0, 0.0, 0.0, 0);""".format(self.name)
                 f.write(self.min_script)
             sp.call("msander -O -i calc/{} -o calc/{} -p calc/prmtop -c calc/inpcrd -r calc/amber.{}.rst".format(self.name_min,self.name_ene,self.name),shell=True, stderr=log, stdin=log, stdout=log)
         elif com_opts['sp']:
-            logger.log(1, '  CALCULATE: {}'.format(self.filename))
+            logger.log(logging.DEBUG, '  CALCULATE: {}'.format(self.filename))
             # Run leap
             sp.call("tleap -f {}".format(self.filename),shell=True, stderr=log, stdin=log, stdout=log) # parm7 rst7 files made
             # Run Min
@@ -2182,6 +2183,12 @@ nmode( x, 3*m.natoms, mme2, 0, 0, 0.0, 0.0, 0);""".format(self.name)
 
 
 #endregion AMBER I/O
+
+def fetch_reference_data(parsed_ref_args) -> List[Datum]:
+    GaussLog(path)
+    #TODO unimplemented
+    data:List[Datum] = []
+    return data
 
 
 #endregion File I/O

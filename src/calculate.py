@@ -218,8 +218,8 @@ def calculate(opts):
     # with the given file.
     # Stuff below doesn't need both comma separated filenames simultaneously.
     for filename, commands_for_filename in commands_for_filenames.items():
-        logger.log(1, '>>> filename: {}'.format(filename))
-        logger.log(1, '>>> commands_for_filename: {}'.format(
+        logger.log(logging.DEBUG, '>>> filename: {}'.format(filename))
+        logger.log(logging.DEBUG, '>>> commands_for_filename: {}'.format(
             commands_for_filename))
         # These next two if statements will break down what command files
         # have to be written by the backend software package.
@@ -253,14 +253,14 @@ def calculate(opts):
 #        inps[comma_sep_filenames].directory = opts.directory
 #        inps[comma_sep_filenames].inpcrd = split_it[0]
 #        inps[comma_sep_filenames].prmtop = split_it[1]
-    logger.log(1, '>>> commands: {}'.format(commands))
+    logger.log(logging.DEBUG, '>>> commands: {}'.format(commands))
     # Check whether or not to skip calculations.
     if opts.norun or opts.fake:
-        logger.log(15, "  -- Skipping backend calculations.")
+        logger.log(logging.DEBUG, "  -- Skipping backend calculations.")
     else:
         for filename, some_class in inps.items():
-            logger.log(1, '>>> filename: {}'.format(filename))
-            logger.log(1, '>>> some_class: {}'.format(some_class))
+            logger.log(logging.DEBUG, '>>> filename: {}'.format(filename))
+            logger.log(logging.DEBUG, '>>> some_class: {}'.format(some_class))
             # Works if some class is None too.
             if hasattr(some_class, 'run'):
                 # Ideally this can be the same for each software backend,

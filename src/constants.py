@@ -68,7 +68,11 @@ LOG_SETTINGS = {
         'handlers': ['console', 'root_file_handler']}
     }
 
-# STEPS
+# STEPS NOTE: these are all specific to MM3 units...
+# TODO in the future these should be unitless constants or in some specified
+#  unit that is agreed upon, then multiplied into the right units and used to
+#  set these constants in the Optimizer class based on the class of the FF
+
 # These are the initial step sizes used in numerical differentiation for all
 # the different parameter types. Floats/integers or strings are accepted.
 #
