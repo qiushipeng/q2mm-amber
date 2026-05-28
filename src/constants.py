@@ -100,7 +100,31 @@ STEPS = {'ae':      1.0,
          'vdwfc':   0.02
          }
 
-# WEIGHTS
+# WEIGHTS (default = EIG_WEIGHTS; the loop.in WGHT command writes to this).
+WEIGHTS = {'a':          2.00,
+           'b':        100.00,
+           't':          1.00,
+           'h':          0.031,
+           'h12':        0.031,
+           'h13':       0.031,
+           'h14':       0.31,
+           'eig_i':      0.00,
+           'eig_d_low':  0.10,
+           'eig_d_high': 0.10,
+           'eig_o':      0.05,
+           'e':         20.00,
+           'e1':        20.00,
+           'eo':       100.00,
+           'e1o':      100.00,
+           'ea':        20.00,
+           'eao':      100.00,
+           'q':         10.00,
+           'qh':        10.00,
+           'qa':        10.00,
+           'esp':       10.00,
+           'p':         10.00
+           }
+
 EIG_WEIGHTS = {'a':          2.00,
            'b':        100.00,
            't':          1.00,
