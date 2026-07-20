@@ -1416,7 +1416,11 @@ class AmberHess(File):
     def hessian(self):
         if self._hessian is None:
             logger.log(logging.DEBUG, 'READING: {}'.format(self.filename))
-            with open("./calc/"+self.filename, 'r') as f:
+            # Use self.path (the caller-supplied full path) rather than a
+            # cwd-relative "./calc/" -- otherwise every AmberHess reads the
+            # same file regardless of which particle/dir it belongs to,
+            # which silently breaks parallel SWARM and any non-cwd caller.
+            with open(self.path, 'r') as f:
                 lines = f.readlines()
             for i,line in enumerate(lines):
                 if i == 0:
@@ -1458,7 +1462,9 @@ class AmberEne(File):
             logger.log(logging.DEBUG, 'READING: {}'.format(self.filename))
             self._structures = []
             flag = 0
-            with open('./calc/'+self.filename, 'r') as f:
+            # Use self.path (caller-supplied full path), not a cwd-relative
+            # "./calc/" fallback -- see AmberHess.hessian above for context.
+            with open(self.path, 'r') as f:
                 sections = {'sp':1, 'minimization':2}
                 calc_section = 'sp'
                 count_previous = 0

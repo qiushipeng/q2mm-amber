@@ -647,7 +647,24 @@ class PSO_DE(SkoBase):
         Returns:
             np.ndarray: resulting self.Y
         """
-        # calculate y for every x in X
+        # Short-circuit to a serial loop when n_processes <= 1: the Pool path
+        # below would try to pickle self.func_raw, which for SwarmOptimizer is
+        # a local closure over instance state (unpicklable). Serial is also
+        # the correct behavior because every particle writes to the same
+        # calc/ dir and frcmod, so concurrent Amber runs would collide.
+        if self.n_processes <= 1:
+            if self.func_args is not None:
+                results = np.array(
+                    [self.func_raw((i, x), self.func_args)
+                     for i, x in enumerate(self.X)]
+                )
+            else:
+                results = np.array(
+                    [self.func_raw((i, x)) for i, x in enumerate(self.X)]
+                )
+            self.Y = results.reshape(-1, 1)
+            return self.Y
+        # calculate y for every x in X (parallel path)
         if self.func_args is not None:
             partial_func = partial(self.func_raw, self.func_args)
             enumerated = enumerate(self.X)
@@ -676,7 +693,11 @@ class PSO_DE(SkoBase):
         """Updates the global best value found by any particle in the swarm."""
         idx_min = self.pbest_y.argmin()
         if self.gbest_y > self.pbest_y[idx_min]:
-            self.gbest_x = self.X[idx_min, :].copy()
+            # Take the position where the particle actually achieved its
+            # personal best (pbest_x), not its CURRENT position (self.X).
+            # After a pso_iter the particle may have moved to somewhere
+            # much worse; self.X[idx_min] would then be misleading.
+            self.gbest_x = self.pbest_x[idx_min, :].copy()
             self.gbest_y = float(self.pbest_y[idx_min])
 
     def recorder(self):

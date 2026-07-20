@@ -306,6 +306,8 @@ class Loop(object):
                 kwargs["precision"] = float(v)
             elif k == "tight":
                 kwargs["tight_spread"] = v.lower() in ("t", "true", "1", "yes")
+            elif k == "n_processes":
+                kwargs["n_processes"] = int(v)
         swarm = opt_module.SwarmOptimizer(
             direc=self.direc, ff=self.ff,
             ff_lines=self.ff.lines, args_ff=self.args_ff,

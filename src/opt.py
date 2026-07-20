@@ -21,6 +21,8 @@ from __future__ import division
 import copy
 import logging
 import logging.config
+import os
+import shutil
 import textwrap
 
 import numpy as np
@@ -37,6 +39,56 @@ logger = logging.getLogger(__file__)
 class OptError(Exception):
     """Raised when an optimizer hits an unrecoverable internal error."""
     pass
+
+
+# --- Parallel SWARM support ------------------------------------------------
+#
+# multiprocessing.Pool.map pickles the callable per task, which means the
+# per-particle fitness has to be a *top-level* (picklable) function, not a
+# closure inside SwarmOptimizer.run. SwarmOptimizer.run stashes the state
+# workers need (FF template, ref data, per-particle dir list, args_ff
+# template) in this module-level dict BEFORE spawning the Pool; on Linux
+# fork, workers inherit it via memory copy-on-write.
+_SWARM_CONTEXT = None
+
+
+def _swarm_particle_fitness(enumerable_input):
+    """
+    Picklable fitness function for parallel SWARM.
+
+    Each call:
+      1) picks the caller's per-particle working directory (indexed by the
+         particle number PSO_DE passes in as `enumerable_input[0]`),
+      2) writes the trial FF into that dir's frcmod,
+      3) runs Amber via the dir's local .in file,
+      4) scores against the reference data cached in _SWARM_CONTEXT.
+
+    Per-particle isolation means concurrent tleap/sander/nab runs don't
+    collide on shared calc/ files.
+    """
+    if isinstance(enumerable_input, tuple) and len(enumerable_input) == 2:
+        idx, params_vec = enumerable_input
+    else:
+        idx, params_vec = 0, enumerable_input
+    ctx = _SWARM_CONTEXT
+    particle_dir = ctx["dirs"][int(idx) % len(ctx["dirs"])]
+    ff_path = os.path.join(particle_dir, ctx["ff_basename"])
+    # Rewrite any .in path in args_ff to point at this particle's copy.
+    args_ff = list(ctx["args_ff_template"])
+    for i, tok in enumerate(args_ff):
+        if isinstance(tok, str) and tok.endswith(".in"):
+            args_ff[i] = os.path.join(particle_dir, os.path.basename(tok))
+    try:
+        trial_ff = copy.deepcopy(ctx["ff_template"])
+        trial_ff.set_param_values(params_vec)
+        trial_ff.export_ff(ff_path, lines=ctx["ff_lines"])
+        data = calculate.main(args_ff)
+        cdict = score.data_by_type(data)
+        rdict = score.data_by_type(ctx["ref_data"])
+        rdict, cdict = score.trim_data(rdict, cdict)
+        return score.compare_data(rdict, cdict)
+    except Exception:
+        return float("inf")
 
 
 def catch_run_errors(func):
@@ -376,7 +428,7 @@ class SwarmOptimizer(Optimizer):
     def __init__(self, direc=None, ff=None, ff_lines=None,
                  args_ff=None, args_ref=None,
                  max_iter=200, pop_size=24, precision=0.001,
-                 tight_spread=True):
+                 tight_spread=True, n_processes=1):
         super(SwarmOptimizer, self).__init__(
             direc=direc, ff=ff, ff_lines=ff_lines,
             args_ff=args_ff, args_ref=args_ref)
@@ -384,6 +436,10 @@ class SwarmOptimizer(Optimizer):
         self.pop_size = pop_size
         self.precision = precision
         self.tight_spread = tight_spread
+        # n_processes = 1 -> serial (safe default). n_processes > 1 spawns
+        # a multiprocessing.Pool with per-particle isolated working dirs so
+        # concurrent tleap/sander/nab runs don't clobber each other's files.
+        self.n_processes = n_processes
 
     @catch_run_errors
     def run(self, ref_data=None):
@@ -433,30 +489,81 @@ class SwarmOptimizer(Optimizer):
             "bounds_strategy": Bounds_Handler.REFLECTIVE,
         })
 
-        def fitness(enumerable_input):
-            # PSO_DE may pass either a bare array or (idx, array) when
-            # pass_particle_num=True; handle both.
-            if isinstance(enumerable_input, tuple) and len(enumerable_input) == 2:
-                _, params_vec = enumerable_input
-            else:
-                params_vec = enumerable_input
-            trial_ff = copy.deepcopy(self.ff)
-            trial_ff.set_param_values(params_vec)
-            try:
-                trial_ff.export_ff(self.ff.path, lines=self.ff.lines)
-                data = calculate.main(self.args_ff)
-                cdict = score.data_by_type(data)
-                rdict, cdict = score.trim_data(score.data_by_type(ref_data), cdict)
-                return score.compare_data(rdict, cdict)
-            except Exception as e:
-                logger.warning("Particle evaluation failed: {}".format(e))
-                return float("inf")
+        # --- pick fitness callable: serial (closure) vs parallel (picklable
+        # module-level function that runs each particle in an isolated dir).
+        if self.n_processes > 1:
+            # Build per-particle working dirs so concurrent workers don't
+            # collide on the shared frcmod / calc/ files.
+            base = os.path.join(self.direc, "swarm_particles")
+            os.makedirs(base, exist_ok=True)
+            # Locate the .in file (leap input) and mol2 in args_ff / near
+            # ff.path so we can copy them into each particle dir.
+            src_frcmod = self.ff.path
+            src_in = None
+            for tok in self.args_ff:
+                if isinstance(tok, str) and tok.endswith(".in"):
+                    src_in = tok
+                    break
+            src_mol2 = None
+            if src_in and os.path.isfile(src_in):
+                cand = os.path.join(os.path.dirname(src_in),
+                                    os.path.basename(src_in)[:-3] + ".mol2")
+                if os.path.isfile(cand):
+                    src_mol2 = cand
+            particle_dirs = []
+            for i in range(self.pop_size):
+                pd = os.path.join(base, "p_{:03d}".format(i))
+                os.makedirs(pd, exist_ok=True)
+                for src in (src_frcmod, src_in, src_mol2):
+                    if src and os.path.isfile(src):
+                        shutil.copyfile(
+                            src, os.path.join(pd, os.path.basename(src))
+                        )
+                particle_dirs.append(pd)
+            # Stash worker state on the module global BEFORE spawning Pool
+            # so Linux-fork workers inherit it.
+            global _SWARM_CONTEXT
+            _SWARM_CONTEXT = {
+                "dirs": particle_dirs,
+                "ff_template": self.ff,
+                "ff_basename": os.path.basename(self.ff.path),
+                "ff_lines": self.ff.lines,
+                "args_ff_template": list(self.args_ff),
+                "ref_data": ref_data,
+            }
+            fitness_callable = _swarm_particle_fitness
+            logger.log(
+                20,
+                "SWARM parallel: {} workers x {} particle dirs under {}".format(
+                    self.n_processes, len(particle_dirs), base
+                ),
+            )
+        else:
+            def fitness(enumerable_input):
+                # PSO_DE may pass either a bare array or (idx, array) when
+                # pass_particle_num=True; handle both.
+                if isinstance(enumerable_input, tuple) and len(enumerable_input) == 2:
+                    _, params_vec = enumerable_input
+                else:
+                    params_vec = enumerable_input
+                trial_ff = copy.deepcopy(self.ff)
+                trial_ff.set_param_values(params_vec)
+                try:
+                    trial_ff.export_ff(self.ff.path, lines=self.ff.lines)
+                    data = calculate.main(self.args_ff)
+                    cdict = score.data_by_type(data)
+                    rdict, cdict = score.trim_data(score.data_by_type(ref_data), cdict)
+                    return score.compare_data(rdict, cdict)
+                except Exception as e:
+                    logger.warning("Particle evaluation failed: {}".format(e))
+                    return float("inf")
+            fitness_callable = fitness
 
         opt = PSO_DE(
-            fitness,
+            fitness_callable,
             len(self.ff.params),
             config=config,
-            n_processes=1,
+            n_processes=self.n_processes,
             pass_particle_num=False,
             verbose=True,
         )
