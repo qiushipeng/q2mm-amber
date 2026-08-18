@@ -193,18 +193,21 @@ def _datum_for_energy(val, idx_1, src_filename, typ="e"):
     )
 
 
-def _datum_for_bond(val, atoms, src_filename, typ="b"):
-    return Datum(val=float(val), typ=typ, src_1=src_filename,
+def _datum_for_bond(val, atoms, src_filename, typ="b", idx=None):
+    return Datum(val=float(val), typ=typ, src_1=src_filename, idx_1=idx,
                  atm_1=atoms[0], atm_2=atoms[1])
 
 
-def _datum_for_angle(val, atoms, src_filename, typ="a"):
-    return Datum(val=float(val), typ=typ, src_1=src_filename,
+def _datum_for_angle(val, atoms, src_filename, typ="a", idx=None):
+    return Datum(val=float(val), typ=typ, src_1=src_filename, idx_1=idx,
                  atm_1=atoms[0], atm_2=atoms[1], atm_3=atoms[2])
 
 
-def _datum_for_torsion(val, atoms, src_filename, typ="t"):
-    return Datum(val=float(val), typ=typ, src_1=src_filename,
+def _datum_for_torsion(val, atoms, src_filename, typ="t", idx=None):
+    # idx (structure number) is folded into the label so the torsion label
+    # matches constants.RE_T_LBL ("t_<name>_<idx>_<a-b-c-d>"); without it,
+    # score.trim_data's RE_T_LBL.split(...)[1] raises IndexError.
+    return Datum(val=float(val), typ=typ, src_1=src_filename, idx_1=idx,
                  atm_1=atoms[0], atm_2=atoms[1], atm_3=atoms[2], atm_4=atoms[3])
 
 
@@ -374,26 +377,79 @@ def _amber_geo(in_path, kind):
     """
     kind: 'b' bonds, 'a' angles, 't' torsions.
     """
-    leap = _amber_run(in_path, [kind + "o"])
+    # NB: get_com_opts() recognizes the amber-prefixed tokens "abo"/"aao"/"ato"
+    # (leading 'a'); passing bare "bo"/"ao"/"to" left sp/opt/geo False, so tleap
+    # was skipped and the build crashed opening the never-written .ene file.
+    leap = _amber_run(in_path, ["a" + kind + "o"])
     geo_path = os.path.join(leap.directory, "calc", leap.name_geo)
     if not os.path.isfile(geo_path):
         logger.warning("Geo file missing: {}".format(geo_path))
         return []
     geo = utilities.AmberGeo(geo_path)
+    return _geo_data_from(geo, kind, os.path.basename(in_path))
+
+
+def _gauss_run(in_path, commands):
+    """
+    Run an AmberLeap_Gaus calculation. This builds the Amber topology from the
+    matching leap input (<name>.in -> mol2 coordinates), takes a single-point
+    (no minimisation), and measures bonds/angles/torsions with the SAME cpptraj
+    enumeration + AmberGeo sort as _amber_geo -- so the reference internal
+    coordinates line up one-for-one with the '-abo/-aao/-ato' side. Returns the
+    AmberLeap_Gaus instance after run() so the caller can read the .geo file.
+
+    NB: the reference geometry comes from <name>.mol2 (via <name>.in), NOT from
+    the Gaussian .log passed on the command line -- the .log path is only used
+    to derive <name>. Put the QM reference geometry in the mol2 accordingly.
+    """
+    leap = utilities.AmberLeap_Gaus(in_path)
+    leap.commands = commands
+    if not getattr(_amber_run, "_skip_run", False):
+        try:
+            leap.run(check_tokens=False)
+        except Exception as e:
+            logger.warning(
+                "AmberLeap_Gaus.run() failed for {}: {}".format(in_path, e))
+    return leap
+
+
+def _gauss_geo(in_path, kind):
+    """
+    Reference geometry collector (bonds 'b', angles 'a', torsions 't') built by
+    AmberLeap_Gaus. Emits Datum objects in the same order as _amber_geo so
+    score.compare_data can pair reference and calculated points positionally.
+    """
+    leap = _gauss_run(in_path, ["a" + kind + "o"])
+    geo_path = os.path.join(leap.directory, "calc", leap.name_geo)
+    if not os.path.isfile(geo_path):
+        logger.warning("Geo file missing: {}".format(geo_path))
+        return []
+    geo = utilities.AmberGeo(geo_path)
+    return _geo_data_from(geo, kind, os.path.basename(in_path))
+
+
+def _geo_data_from(geo, kind, src):
+    """
+    Turn an AmberGeo object's structures into Datum objects. Shared by the
+    Amber ('-abo/-aao/-ato') and Gaussian ('-gabo/-gaao/-gato') geometry
+    collectors so both sides label and order their data identically. The
+    1-based structure index is stamped into each Datum (idx_1) so torsion
+    labels satisfy constants.RE_T_LBL.
+    """
     data = []
-    for s in geo.structures:
+    for i, s in enumerate(geo.structures, 1):
         if kind == "b":
             for bond in s.bonds:
                 data.append(_datum_for_bond(bond.value, bond.atom_nums,
-                                            os.path.basename(in_path), typ="b"))
+                                            src, typ="b", idx=i))
         elif kind == "a":
             for ang in s.angles:
                 data.append(_datum_for_angle(ang.value, ang.atom_nums,
-                                             os.path.basename(in_path), typ="a"))
+                                             src, typ="a", idx=i))
         elif kind == "t":
             for tor in s.torsions:
                 data.append(_datum_for_torsion(tor.value, tor.atom_nums,
-                                               os.path.basename(in_path), typ="t"))
+                                               src, typ="t", idx=i))
     return data
 
 
@@ -411,6 +467,9 @@ _COMMAND_DISPATCH = [
     ("abo",  "b",   lambda p, opts: _amber_geo(p, "b")),
     ("aao",  "a",   lambda p, opts: _amber_geo(p, "a")),
     ("ato",  "t",   lambda p, opts: _amber_geo(p, "t")),
+    ("gabo", "b",   lambda p, opts: _gauss_geo(p, "b")),
+    ("gaao", "a",   lambda p, opts: _gauss_geo(p, "a")),
+    ("gato", "t",   lambda p, opts: _gauss_geo(p, "t")),
     ("gh",   "h",   lambda p, opts: _gauss_log_eigmat(p, invert=opts.invert)),
     ("ge",   "e",   lambda p, opts: _gauss_log_energy(p, typ="e")),
     ("ge1",  "e1",  lambda p, opts: _gauss_log_energy(p, typ="e1")),

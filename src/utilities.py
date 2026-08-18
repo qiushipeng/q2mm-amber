@@ -1593,19 +1593,28 @@ class AmberGeo(File):
     def read_line_for_bond(self, line):
         # All bond data starts with the string "Bond" and then the rest of the
         # interaction information.
-        a,b,z = line.split()
+        cols = line.split()
+        if len(cols) != 3:          # skip section headers ("BONDS"), "END", blanks
+            return None
+        a,b,z = cols
         atom_nums = [int(x) for x in [a,b]]
         value = float(z)
         return Bond(atom_nums=atom_nums, value=value)
 
     def read_line_for_angle(self, line):
-        a,b,c,z = line.split()
+        cols = line.split()
+        if len(cols) != 4:          # skip "ANGLES"/"END"/blank lines
+            return None
+        a,b,c,z = cols
         atom_nums = [int(x) for x in [a,b,c]]
         value = float(z)
         return Angle(atom_nums=atom_nums, value=value)
 
     def read_line_for_torsion(self, line):
-        a,b,c,d,z = line.split()
+        cols = line.split()
+        if len(cols) != 5:          # skip "TORSIONS"/"END"/blank lines
+            return None
+        a,b,c,d,z = cols
         atom_nums = [int(x) for x in [a,b,c,d]]
         value = float(z)
         return Torsion(atom_nums=atom_nums, value=value)
@@ -1704,13 +1713,13 @@ class AmberLeap_Gaus(File):
 # 'fixatomorder' command is removed because it causes mismatches between the line
 # numbers of atoms, thus producing nonsensical bond lengths in the output .geo files.
 # This was pinpointed by Mikaela and Himani on 11/28/22 and running without this command
-# does not crash, produce errors, or result in nonsensical bonds.  It must be removed for
-# the gaussian (reference) version of this script as well ~line 597.
+# does not crash, produce errors, or result in nonsensical bonds.
+# [Removed 2026-08 from the extract() script below AND from AmberLeap.extract():
+#  with fixatomorder present, cpptraj measured a C-H bond as ~5.9 A instead of ~1.09 A.]
 
     def extract(self,log):
         script="""
 trajin calc/gaus.NAME.nc
-fixatomorder
 AA
 run
 write
@@ -1735,7 +1744,7 @@ exit
                 count = 1
 
             # Angles
-            if "[dihedrals]" in line:
+            if "[dihedrals" in line:   # matches "[dihedrals]" and "[dihedrals *]"
                 count = 0
             if count == 2:
                 angles.append(line.split()[-6:-3])
@@ -1800,7 +1809,7 @@ exit
             f.write(self.dyn_script)
         sp.call("sander -O -i calc/{} -o calc/traj.out -p calc/prmtop -c calc/gaus.{}.rst -x calc/gaus.{}.nc".format(self.name_dyn,self.name,self.name),shell=True)
         # Generate All geometry
-        int_script = "bonds\nangles\ndihedrals\n"
+        int_script = "bonds\nangles\ndihedrals *\n"
         with open('./calc/'+self.name_int, 'w') as f:
             f.write(int_script)
         sp.call("cpptraj -p calc/prmtop < calc/{} > calc/{} \n".format(self.name_int,self.name_geo),shell=True)
@@ -1924,12 +1933,12 @@ class AmberLeap(File):
 # 'fixatomorder' command is removed because it causes mismatches between the line
 # numbers of atoms, thus producing nonsensical bond lengths in the output .geo files.
 # This was pinpointed by Mikaela and Himani on 11/28/22 and running without this command
-# does not crash, produce errors, or result in nonsensical bonds.  It must be removed for
-# the gaussian (reference) version of this script as well ~line 378.
+# does not crash, produce errors, or result in nonsensical bonds.
+# [Removed 2026-08 from this extract() script AND from AmberLeap_Gaus.extract():
+#  with fixatomorder present, cpptraj measured a C-H bond as ~5.9 A instead of ~1.09 A.]
 
         script="""
 trajin calc/amber.NAME.nc
-fixatomorder
 AA
 run
 write
@@ -1955,7 +1964,7 @@ exit
                 count = 1
 
             # Angles
-            if "[dihedrals]" in line:
+            if "[dihedrals" in line:   # matches "[dihedrals]" and "[dihedrals *]"
                 count = 0
             if count == 2:
                 angles.append(line.split()[-6:-3])
@@ -2098,7 +2107,7 @@ nmode( x, 3*m.natoms, mme2, 0, 0, 0.0, 0.0, 0);""".format(self.name)
                 count = 1
 
             # Angles
-            if "[dihedrals]" in line:
+            if "[dihedrals" in line:   # matches "[dihedrals]" and "[dihedrals *]"
                 count = 0
             if count == 2:
                 angles.append(line.split()[-6:-3])
@@ -2130,7 +2139,7 @@ nmode( x, 3*m.natoms, mme2, 0, 0, 0.0, 0.0, 0);""".format(self.name)
             f.write(self.dyn_script)
         sp.call("sander -O -i calc/{} -o calc/traj.out -p calc/prmtop -c calc/amber.{}.rst -x calc/amber.{}.nc".format(self.name_dyn,self.name,self.name),shell=True)
         # Generate All geometry
-        int_script = "bonds\nangles\ndihedrals\n"
+        int_script = "bonds\nangles\ndihedrals *\n"
         with open('./calc/'+self.name_int, 'w') as f:
             f.write(int_script)
         sp.call("cpptraj -p calc/prmtop < calc/{} > calc/{}".format(self.name_int,self.name_geo),shell=True)
