@@ -1518,7 +1518,12 @@ class AmberGeo(File):
         if self._structures == None:
             logger.log(logging.DEBUG, 'READING: {}'.format(self.filename))
             self._structures = []
-            with open("./calc/"+self.filename, 'r') as f:
+            # Use self.path (the caller-supplied full path) rather than a
+            # cwd-relative "./calc/" -- otherwise every AmberGeo reads the same
+            # file regardless of which particle dir it belongs to, silently
+            # breaking parallel SWARM (all particles score the base geometry so
+            # the global best never improves). Same fix as AmberHess.hessian.
+            with open(self.path, 'r') as f:
                 sections = {'sp':1, 'minimization':2, 'hessian':2}
                 count_previous = 0
                 calc_section = 'sp'
