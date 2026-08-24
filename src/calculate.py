@@ -46,6 +46,37 @@ logger = logging.getLogger(__file__)
 
 
 # ---------------------------------------------------------------------------
+# Fixed atoms (FXATM). Hessian elements that couple one of these atoms are
+# given weight 0 -- excluded from the fit. Mirrors q2mm-master's fixedatoms.txt
+# feature, but the file path is supplied by the loop.in `FXATM <file>` command
+# instead of a hardcoded "fixedatoms.txt". Stored module-side so it is inherited
+# by Linux-fork swarm workers (like the rest of the swarm's worker state).
+# ---------------------------------------------------------------------------
+_FIXED_ATOMS = set()
+
+
+def load_fixed_atoms(path):
+    """Read a fixed-atoms file (one 1-based atom index per line) and store the
+    exclusion set for Hessian weighting. Any Hessian element coupling one of
+    these atoms is given weight 0 in _int_wht (dropped from the objective).
+    Returns the set; a missing/empty path clears the exclusion."""
+    global _FIXED_ATOMS
+    atoms = set()
+    if path and os.path.isfile(path):
+        with open(path) as fh:
+            for line in fh:
+                s = line.split()
+                if len(s) == 1:
+                    atoms.add(int(s[0]))
+        logger.log(20, "FXATM: excluding {} fixed atom(s) from the Hessian "
+                   "fit: {}".format(len(atoms), sorted(atoms)))
+    else:
+        logger.warning("FXATM: file not found, no atoms excluded: {}".format(path))
+    _FIXED_ATOMS = atoms
+    return atoms
+
+
+# ---------------------------------------------------------------------------
 # CLI argument parser (kept compatible with the old codebase)
 # ---------------------------------------------------------------------------
 
@@ -180,6 +211,11 @@ def _int_wht(at_1, at_2, int2, int3, int4):
         return co.WEIGHTS["h13"]
     if pair_a in int4 or pair_b in int4:
         return co.WEIGHTS["h14"]
+    # FXATM fixed-atom exclusion: drop long-range couplings that involve a
+    # user-flagged fixed atom (weight 0). Placed after the 1-2/1-3/1-4 checks
+    # so bonded terms for a fixed atom keep their weights, matching q2mm-master.
+    if _FIXED_ATOMS and (at_1 in _FIXED_ATOMS or at_2 in _FIXED_ATOMS):
+        return 0.0
     return co.WEIGHTS["h"]
 
 

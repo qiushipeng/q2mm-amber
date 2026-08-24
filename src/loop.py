@@ -26,6 +26,10 @@ SWARM [opts ...]          Run opt.SwarmOptimizer.run(). Options:
                           max_iter=N pop_size=N precision=F tight=T|F
 WGHT <typ> <weight>       Override constants.WEIGHTS[typ] (eg "WGHT b 100.").
 STEP <ptype> <step>       Override constants.STEPS[ptype].
+FXATM <file>              Exclude fixed atoms from the Hessian fit. <file>
+                          lists one 1-based atom index per line; Hessian
+                          elements coupling those atoms get weight 0. Put it
+                          before COMP/SWARM so the exclusion is in effect.
 END                       Terminates an inner LOOP block (no-op outside).
 
 Usage
@@ -206,6 +210,10 @@ class Loop(object):
             elif cmd == "STEP":
                 co.STEPS[cols[1]] = float(cols[2])
                 logger.log(20, "STEP {} = {}".format(cols[1], cols[2]))
+
+            elif cmd == "FXATM":
+                import calculate
+                calculate.load_fixed_atoms(os.path.join(self.direc, cols[1]))
 
             elif cmd == "END":
                 # Stray END outside of a LOOP block - skip.
