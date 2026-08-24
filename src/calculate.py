@@ -49,18 +49,20 @@ logger = logging.getLogger(__file__)
 # Fixed atoms (FXATM). Hessian elements that couple one of these atoms are
 # given weight 0 -- excluded from the fit. Mirrors q2mm-master's fixedatoms.txt
 # feature, but the file path is supplied by the loop.in `FXATM <file>` command
-# instead of a hardcoded "fixedatoms.txt". Stored module-side so it is inherited
-# by Linux-fork swarm workers (like the rest of the swarm's worker state).
+# instead of a hardcoded "fixedatoms.txt". The set lives in constants (co) so
+# both calculate and score can read it without a circular import, and the
+# exclusion is applied at SCORE time (score.compare_data) -- that makes it
+# placement-proof: FXATM only has to precede the COMP/SWARM that scores, not
+# the CDAT that built the data. co is a module global, so Linux-fork swarm
+# workers inherit it like the rest of the swarm's worker state.
 # ---------------------------------------------------------------------------
-_FIXED_ATOMS = set()
 
 
 def load_fixed_atoms(path):
     """Read a fixed-atoms file (one 1-based atom index per line) and store the
-    exclusion set for Hessian weighting. Any Hessian element coupling one of
-    these atoms is given weight 0 in _int_wht (dropped from the objective).
+    exclusion set in co.FIXED_ATOMS. Hessian elements coupling one of these
+    atoms are dropped from the objective at score time (score.compare_data).
     Returns the set; a missing/empty path clears the exclusion."""
-    global _FIXED_ATOMS
     atoms = set()
     if path and os.path.isfile(path):
         with open(path) as fh:
@@ -72,7 +74,7 @@ def load_fixed_atoms(path):
                    "fit: {}".format(len(atoms), sorted(atoms)))
     else:
         logger.warning("FXATM: file not found, no atoms excluded: {}".format(path))
-    _FIXED_ATOMS = atoms
+    co.FIXED_ATOMS = set(atoms)
     return atoms
 
 
@@ -147,11 +149,14 @@ def _datum_for_eigmat(val, i, j, src_filename):
     )
 
 
-def _datum_for_h(val, i, j, src_filename, atm_1=None, atm_2=None, wht=None):
+def _datum_for_h(val, i, j, src_filename, atm_1=None, atm_2=None, wht=None,
+                 hlr=None):
     # One mass-weighted Hessian matrix element. typ='h' so the scoring
     # machinery picks 'h'-style weights. atm_1/atm_2 carry the atom indices
     # so a distance-based weight (q2mm-master's int_wht) can be evaluated
-    # by the caller and stamped via the wht argument.
+    # by the caller and stamped via the wht argument. hlr flags the
+    # "long-range" class so FXATM zeroes those (and only those) for fixed
+    # atoms at score time (bonded terms are kept); see score.compare_data.
     return Datum(
         val=float(val),
         typ="h",
@@ -161,6 +166,7 @@ def _datum_for_h(val, i, j, src_filename, atm_1=None, atm_2=None, wht=None):
         atm_1=atm_1,
         atm_2=atm_2,
         wht=wht,
+        hlr=hlr,
     )
 
 
@@ -201,22 +207,20 @@ def _int_wht(at_1, at_2, int2, int3, int4):
     #   all other (>3 bonds apart):              WEIGHTS['h']   = 0.031
     # The 1-4 terms are emphasized (0.31) to represent the TS as a minimum.
     # Pairs are stored unordered, so check both orders.
+    # Returns (weight, is_long_range). is_long_range is True only for the
+    # ">3 bonds apart" class -- the one q2mm-master zeroes for fixed atoms;
+    # diagonal and 1-2/1-3/1-4 (bonded) return False so FXATM keeps them.
     if at_1 == at_2:
-        return 0.0
+        return 0.0, False
     pair_a = [at_1, at_2]
     pair_b = [at_2, at_1]
     if pair_a in int2 or pair_b in int2:
-        return co.WEIGHTS["h12"]
+        return co.WEIGHTS["h12"], False
     if pair_a in int3 or pair_b in int3:
-        return co.WEIGHTS["h13"]
+        return co.WEIGHTS["h13"], False
     if pair_a in int4 or pair_b in int4:
-        return co.WEIGHTS["h14"]
-    # FXATM fixed-atom exclusion: drop long-range couplings that involve a
-    # user-flagged fixed atom (weight 0). Placed after the 1-2/1-3/1-4 checks
-    # so bonded terms for a fixed atom keep their weights, matching q2mm-master.
-    if _FIXED_ATOMS and (at_1 in _FIXED_ATOMS or at_2 in _FIXED_ATOMS):
-        return 0.0
-    return co.WEIGHTS["h"]
+        return co.WEIGHTS["h14"], False
+    return co.WEIGHTS["h"], True
 
 
 def _datum_for_energy(val, idx_1, src_filename, typ="e"):
@@ -402,9 +406,9 @@ def _amber_hessian_eigmat(in_path, invert=None):
         # 1-based numbering. // is integer division on 0-based equivalents.
         atm_1 = int(i // 3 + 1)
         atm_2 = int(j // 3 + 1)
-        wht = _int_wht(atm_1, atm_2, int2, int3, int4)
+        wht, hlr = _int_wht(atm_1, atm_2, int2, int3, int4)
         data.append(_datum_for_h(H[i, j], i + 1, j + 1, src,
-                                 atm_1=atm_1, atm_2=atm_2, wht=wht))
+                                 atm_1=atm_1, atm_2=atm_2, wht=wht, hlr=hlr))
     return data
 
 

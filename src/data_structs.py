@@ -44,6 +44,7 @@ class Datum(object):
         "atm_3",
         "atm_4",
         "ff_row",
+        "hlr",
     ]
 
     def __init__(
@@ -62,6 +63,7 @@ class Datum(object):
         atm_3=None,
         atm_4=None,
         ff_row=None,
+        hlr=None,
     ):
         self._lbl = lbl
         self.val = val
@@ -77,6 +79,10 @@ class Datum(object):
         self.atm_3 = atm_3
         self.atm_4 = atm_4
         self.ff_row = ff_row
+        # Hessian long-range flag: True only for the ">3 bonds apart" class,
+        # which FXATM zeroes for fixed atoms (bonded terms are kept). Set at
+        # build time in calculate._amber_hessian_eigmat; None for non-Hessian.
+        self.hlr = hlr
 
     def __repr__(self):
         return "{}({:7.4f})".format(self.lbl, self.val)

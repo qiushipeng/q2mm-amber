@@ -125,6 +125,11 @@ WEIGHTS = {'a':          2.00,
            'p':         10.00
            }
 
+# Fixed atoms (FXATM): 1-based atom indices whose Hessian couplings are
+# excluded from the fit (weight 0), applied at score time in score.compare_data.
+# Populated by the loop.in `FXATM <file>` command; empty means no exclusion.
+FIXED_ATOMS = set()
+
 EIG_WEIGHTS = {'a':          2.00,
            'b':        100.00,
            't':          1.00,

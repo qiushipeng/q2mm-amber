@@ -223,6 +223,16 @@ def compare_data(r_dict, c_dict, output=None, doprint=False):
             elif typ == "h":
                 norm = len(c_dict[typ]) if len(c_dict[typ]) else 1
                 disp_wht = c.wht
+                # FXATM: drop the LONG-RANGE Hessian couplings of a fixed atom,
+                # matching q2mm-master (bonded 1-2/1-3/1-4 terms are kept). c.hlr
+                # is stamped True at build time only for the long-range class.
+                # Applied here (score time) so it is placement-proof -- FXATM only
+                # has to precede the COMP/SWARM that scores, not the CDAT that
+                # built the data. Overrides the printed Weight column too, so
+                # start/opt stay consistent. co.FIXED_ATOMS defaults to empty.
+                if getattr(co, "FIXED_ATOMS", None) and getattr(c, "hlr", False) \
+                        and (c.atm_1 in co.FIXED_ATOMS or c.atm_2 in co.FIXED_ATOMS):
+                    disp_wht = 0.0
                 score = (disp_wht ** 2 * diff ** 2) / norm
             else:
                 norm = len(r_dict[typ]) if len(r_dict[typ]) else 1
