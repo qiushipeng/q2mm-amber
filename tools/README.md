@@ -258,6 +258,16 @@ a parameter failed to find an analog — investigate before optimizing.
 
 ---
 
+## Next — fit the seeded parameters
+
+The force field is now tleap-ready, but every term in the `.review` file is
+still a placeholder. [`../OPTIMIZATION.md`](../OPTIMIZATION.md) covers running
+the Q2MM fit against your QM reference — the parameter file, the `loop.in`
+command set, and the gradient (`GRAD`) and hybrid (`SWARM`) optimizers — plus
+the AmberTools patch required for `-ah` Hessian data.
+
+---
+
 ## Troubleshooting
 
 | symptom | cause and fix |
