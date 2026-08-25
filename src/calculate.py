@@ -255,18 +255,18 @@ def _datum_for_torsion(val, atoms, src_filename, typ="t", idx=None):
 # Per-file collectors
 # ---------------------------------------------------------------------------
 
-def _gauss_log_eigmat(path, invert=None):
+def _gauss_log_hessian(path, invert=None):
     """
     Read the raw 3N x 3N Hessian from a Gaussian frequency archive,
     mass-weight it, and emit its lower-triangular elements as
-    Datum (typ='eig'). Matches q2mm-master's 'gh' convention so the
+    Datum (typ='h'). Matches q2mm-master's 'gh' convention so the
     Gaussian and Amber sides always produce identical shapes
     (3N(3N+1)/2 elements) for any molecule size, with no projection
     or eigenvalue-counting needed.
 
-    If `invert` is given, the smallest Hessian eigenvalue is forced
-    to that value (flips a TS imaginary frequency to a real one
-    before the matrix is reassembled).
+    If `invert` is given, the most-negative Hessian eigenvalue (the TS
+    reaction coordinate) is replaced by that value, flipping the
+    imaginary frequency to a real one before the matrix is reassembled.
     """
     # Open the Gaussian .log via the utilities wrapper.
     log = utilities.GaussLog(path)
@@ -350,16 +350,16 @@ def _amber_run(in_path, commands):
     return leap
 
 
-def _amber_hessian_eigmat(in_path, invert=None):
+def _amber_hessian(in_path, invert=None):
     """
     Read the 3N x 3N mass-weighted Hessian produced by Amber's nab/nmode,
     and emit its lower-triangular elements as Datum (typ='h') with
     per-element distance-based weights, matching q2mm-master's '-ah'
-    convention (calculate.py int_wht). Mirrors _gauss_log_eigmat on the
+    convention (calculate.py int_wht). Mirrors _gauss_log_hessian on the
     Gaussian side for dimension alignment.
 
-    If `invert` is given, the smallest eigenvalue is replaced with
-    `invert` (TS imaginary-mode flip) before the matrix is reassembled.
+    If `invert` is given, the most-negative eigenvalue (the TS reaction
+    coordinate) is replaced with `invert` before the matrix is reassembled.
     """
     # Run tleap + sander min + nab to (re)generate the .hes and geo files.
     leap = _amber_run(in_path, ["ah"])
@@ -513,7 +513,7 @@ def _geo_data_from(geo, kind, src):
 
 # (command flag, datum type, collector function)
 _COMMAND_DISPATCH = [
-    ("ah",   "h",   lambda p, opts: _amber_hessian_eigmat(p, invert=opts.invert)),
+    ("ah",   "h",   lambda p, opts: _amber_hessian(p, invert=opts.invert)),
     ("ae",   "e",   lambda p, opts: _amber_energy(p, typ="e")),
     ("ae1",  "e1",  lambda p, opts: _amber_energy(p, typ="e1")),
     ("aeo",  "eo",  lambda p, opts: _amber_energy(p, typ="eo")),
@@ -524,7 +524,7 @@ _COMMAND_DISPATCH = [
     ("gabo", "b",   lambda p, opts: _gauss_geo(p, "b")),
     ("gaao", "a",   lambda p, opts: _gauss_geo(p, "a")),
     ("gato", "t",   lambda p, opts: _gauss_geo(p, "t")),
-    ("gh",   "h",   lambda p, opts: _gauss_log_eigmat(p, invert=opts.invert)),
+    ("gh",   "h",   lambda p, opts: _gauss_log_hessian(p, invert=opts.invert)),
     ("ge",   "e",   lambda p, opts: _gauss_log_energy(p, typ="e")),
     ("ge1",  "e1",  lambda p, opts: _gauss_log_energy(p, typ="e1")),
     ("geo",  "eo",  lambda p, opts: _gauss_log_energy(p, typ="eo")),

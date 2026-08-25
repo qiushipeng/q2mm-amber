@@ -81,7 +81,7 @@ class Datum(object):
         self.ff_row = ff_row
         # Hessian long-range flag: True only for the ">3 bonds apart" class,
         # which FXATM zeroes for fixed atoms (bonded terms are kept). Set at
-        # build time in calculate._amber_hessian_eigmat; None for non-Hessian.
+        # build time in calculate._amber_hessian; None for non-Hessian.
         self.hlr = hlr
 
     def __repr__(self):
