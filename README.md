@@ -46,13 +46,17 @@ files and workflows read alike.
   [`OPTIMIZATION.md` §0](OPTIMIZATION.md). Without it the `-ah`
   flag produces no data.
 
+Point `$AMBERHOME` at your AmberTools installation and `$AMBERCLASSICHOME` at
+your AmberClassic one, then:
+
 ```bash
 conda activate q2mm
-source /groups/owiest/Q2MM/tools/AmberClassic/AmberClassic.sh
-source /groups/owiest/Q2MM/tools/ambertools26/amber.sh
+source $AMBERCLASSICHOME/AmberClassic.sh
+source $AMBERHOME/amber.sh
 ```
 
-> The group build under `/groups/owiest/Q2MM/tools/` is already patched.
+> Check with your site administrator before patching — a shared AmberTools
+> build may already include it.
 
 ---
 
@@ -109,6 +113,7 @@ DIR /absolute/path/to/rundir
 FFLD read MOL.frcmod
 PARM params.txt
 RDAT -gh MOL.log -i 1
+FXATM fixedatoms.txt          # optional: exclude QM-frozen atoms
 CDAT -ah MOL.in
 COMP -o start.txt
 SWARM max_iter=200 pop_size=24 tight=false n_processes=24

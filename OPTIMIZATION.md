@@ -21,7 +21,12 @@ search:
 |---|---|
 | `$SRC` | `/path/to/q2mm-amber/src` |
 | `$WORK` | your run directory (absolute path) |
+| `$AMBERHOME` | your AmberTools installation |
+| `$AMBERCLASSICHOME` | your AmberClassic installation (provides `nab`) |
 | `MOL` | your molecule stem, eg `Thio` |
+
+Set the Amber variables to match your site — the exact paths differ per
+installation.
 
 ---
 
@@ -81,9 +86,9 @@ Then rebuild AmberTools as usual for your installation. The dump must come
 *after* the mass weighting — Q2MM expects a **mass-weighted** Hessian and does
 not re-weight the Amber side.
 
-> **Our group build is already patched.** The `AmberClassic` install under
-> `/groups/owiest/Q2MM/tools/` provides the patched `nab`, so ordinary users
-> can skip this section entirely.
+> **Check before you patch.** A shared AmberTools/AmberClassic build may
+> already carry this modification, in which case you can skip this section
+> entirely — ask whoever maintains your installation.
 
 **Verify** — after any Amber run with `-ah`, this file must exist and be
 non-empty:
@@ -101,8 +106,8 @@ Schrödinger.
 
 ```bash
 conda activate q2mm
-source /groups/owiest/Q2MM/tools/AmberClassic/AmberClassic.sh
-source /groups/owiest/Q2MM/tools/ambertools26/amber.sh
+source $AMBERCLASSICHOME/AmberClassic.sh
+source $AMBERHOME/amber.sh
 ```
 
 ---
@@ -265,16 +270,70 @@ positive curvature. `-i <value>` replaces that most-negative eigenvalue with
 ### `FXATM` — fixed atoms
 
 ```
-FXATM fixedatoms.txt
+FXATM <file>
 ```
 
-`fixedatoms.txt` lists one 1-based atom index per line — the atoms that were
-**frozen in the reference QM calculation** (typically truncated-cluster
-boundary atoms). Their long-range Hessian couplings are contaminated by the
-constraint, so they are given weight 0 and dropped from the fit; their bonded
-(1-2 / 1-3 / 1-4) terms are kept. The exclusion is applied at **score time**,
-so the command works wherever you put it. Omit the line entirely if nothing is
-frozen — a stray `fixedatoms.txt` in the directory does nothing on its own.
+Excludes atoms that were **frozen in the reference QM calculation** — typically
+the truncated-cluster boundary atoms held at their crystal/enzyme positions.
+Their Hessian curvature is an artefact of the geometric constraint rather than
+real molecular stiffness, so fitting force constants to it biases the result.
+
+The file lists **one 1-based atom index per line** (mol2 numbering):
+
+```
+# fixedatoms.txt
+18
+20
+32
+35
+38
+41
+43
+```
+
+Usage in context — the whole point is that it applies to the Hessian, so pair
+it with an `-ah` / `-gh` cycle:
+
+```
+DIR ./
+FFLD read Thio.frcmod
+PARM BandA_FC.txt
+RDAT -gh Thio.log -i 4500
+FXATM fixedatoms.txt          # exclude these atoms from the Hessian fit
+CDAT -ah Thio.in
+COMP -o ./bafc_start.txt
+SWARM max_iter=200 pop_size=24 precision=0.001 tight=false n_processes=24
+FFLD write ./frcmod.gaff.01
+CDAT
+COMP -o ./bafc_opt.01.txt
+```
+
+What it does to the weights:
+
+| Hessian element | weight |
+|---|---|
+| long-range coupling involving a fixed atom | **0** — dropped from the fit |
+| bonded (1-2 / 1-3 / 1-4) term of a fixed atom | unchanged — still fitted |
+| everything else | unchanged |
+
+Keeping the bonded terms matches upstream Q2MM's weighting: a constrained
+atom's local bond/angle curvature is still useful signal, while its long-range
+cross-terms are where the constraint contamination sits.
+
+Two practical notes:
+
+* **Placement does not matter.** The exclusion is applied at *score* time, so
+  `FXATM` works wherever it sits in the file — before or after `CDAT`. (In an
+  earlier version it was applied when the data was built, which made the
+  weights differ between a `COMP` before and after the command.)
+* **It is opt-in.** Omit the line and nothing is excluded; a stray
+  `fixedatoms.txt` sitting in the directory does nothing on its own, unlike
+  upstream Q2MM which auto-reads any file with that name.
+
+> `FXATM` is the right tool for genuinely QM-frozen atoms. It is *not* the fix
+> for a reaction-centre contact that blows up the Amber Hessian — that is a
+> missing bond in the `mol2`, and excluding the atoms hides the problem rather
+> than solving it.
 
 ---
 
@@ -518,8 +577,8 @@ On the cluster, wrap that in a submit script and request the cores you gave to
 #$ -q long
 
 conda activate q2mm
-source /groups/owiest/Q2MM/tools/AmberClassic/AmberClassic.sh
-source /groups/owiest/Q2MM/tools/ambertools26/amber.sh
+source $AMBERCLASSICHOME/AmberClassic.sh
+source $AMBERHOME/amber.sh
 
 python $SRC/loop.py loop.in
 ```
