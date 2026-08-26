@@ -147,7 +147,7 @@ def import_weights(data):
             datum.wht = co.WEIGHTS[datum.typ]
 
 
-def compare_data(r_dict, c_dict, output=None, doprint=False):
+def compare_data(r_dict, c_dict, output=None, doprint=False, strict=True):
     """
     Compute chi^2 = sum w^2 * (x_r - x_c)^2, bucket-normalised.
 
@@ -192,7 +192,22 @@ def compare_data(r_dict, c_dict, output=None, doprint=False):
     )
 
     for typ in data_types:
-        if typ not in c_dict:
+        # A bucket that is absent -- or shorter than the reference -- would
+        # otherwise contribute ZERO to the total (the old code skipped it, and
+        # zip() below silently truncates to the shorter list while `norm` still
+        # divides by the full reference count). That REWARDS a force field whose
+        # calculation failed: such a candidate drops the whole penalty for that
+        # data type, so no honest candidate can ever beat it and the optimizer
+        # locks onto it permanently.
+        n_ref = len(r_dict[typ])
+        n_calc = len(c_dict[typ]) if typ in c_dict else 0
+        if n_calc != n_ref:
+            msg = ("data bucket '{}': calculated {} point(s) but reference has "
+                   "{} -- the calculation is incomplete.".format(typ, n_calc, n_ref))
+            if strict:
+                logger.warning(msg + " Scoring as inf.")
+                return float("inf")
+            logger.warning(msg + " Bucket skipped; score is NOT comparable.")
             continue
         total_num += len(r_dict[typ])
         if typ in ("e", "eo", "ea", "eao"):

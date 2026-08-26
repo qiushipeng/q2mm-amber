@@ -87,7 +87,10 @@ def _swarm_particle_fitness(enumerable_input):
         rdict = score.data_by_type(ctx["ref_data"])
         rdict, cdict = score.trim_data(rdict, cdict)
         return score.compare_data(rdict, cdict)
-    except Exception:
+    except Exception as e:
+        # Never fail silently: a swallowed error here looks like a legitimate
+        # (very bad) score, and 24 workers can fail every iteration unnoticed.
+        logger.warning("SWARM particle %s failed in %s: %s", idx, particle_dir, e)
         return float("inf")
 
 
