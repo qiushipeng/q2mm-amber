@@ -1,55 +1,52 @@
-# Atom-typing tools for building a transition-state force field
+# build_tsff.py — transition-state force fields from a RESP mol2
 
-Two standalone scripts that turn a plain GAFF/GAFF2 `mol2` into a
-tleap-ready transition-state force field (TSFF):
+One script, one command:
 
-| script | what it does |
-|---|---|
-| `map_published.py` | transfers **published** atom types onto your molecule by structure matching, and merges your custom selection |
-| `clone_atom_types.py` | re-types the selected atoms and writes the `frcmod` supplying every parameter those new types touch |
+```
+MOL_resp.mol2  ->  MOL.mol2  +  MOL.frcmod
+```
 
-They only use the Python standard library and import nothing from the rest of
-the package, so they can be run directly from this directory.
+A re-typed structure and a **single self-contained frcmod**. Nothing else to
+load, nothing else to remember.
+
+```bash
+python $TOOLS/build_tsff.py MOL_resp.mol2 --sel sel.txt \
+    --published COFACTOR.lib frcmod.COFACTOR -o MOL
+```
+
+It uses only the Python standard library and shells out to `parmchk2` and
+`tleap`, so it can be run directly from this directory.
 
 ---
 
-## Conventions used below
-
-Replace these with your own paths:
+## Placeholders used below
 
 | placeholder | meaning |
 |---|---|
 | `$TOOLS` | this directory |
 | `$AMBERHOME` | your AmberTools installation |
-| `$GAFF` | `$AMBERHOME/dat/leap/parm/gaff2.dat` |
-| `$WORK` | the directory holding your molecule |
 
 ```bash
 export AMBERHOME=/path/to/ambertools
 export PATH=$AMBERHOME/bin:$PATH
-export GAFF=$AMBERHOME/dat/leap/parm/gaff2.dat
 export TOOLS=/path/to/q2mm-amber/tools
 ```
 
-Use a Python 3 interpreter (a conda environment is fine).
+`gaff2.dat` is found automatically under `$AMBERHOME`; override with `--gaff`.
 
 ---
 
-## Inputs you need
+## Inputs
 
-| file | description |
-|---|---|
-| `MOL_resp.mol2` | your molecule: RESP charges, GAFF2 atom types, **TS geometry** |
-| `sel.txt` | the reactive atoms you want custom types for |
-| `PUB.lib` | published structure carrying the published atom types (`.lib`/`.off`/`.mol2`) |
-| `frcmod.PUB` | published parameters |
+| file | required | description |
+|---|---|---|
+| `MOL_resp.mol2` | yes | your molecule: GAFF/GAFF2 types, RESP charges, **TS geometry** |
+| `sel.txt` | for a TS | the reactive atoms to give custom types |
+| `COFACTOR.lib` + `frcmod.COFACTOR` | optional | a published parameter set to adopt |
 
-The last two are only needed if part of your molecule has published
-parameters (a cofactor, a substrate analogue, ...). Skip them otherwise.
+### `sel.txt`
 
-### `sel.txt` format
-
-One atom per line: **mol2 atom index, new type, parent type**.
+One atom per line: **mol2 index, new type, parent type**.
 
 ```
 # atom_index   new_type   parent_type
@@ -60,211 +57,149 @@ One atom per line: **mol2 atom index, new type, parent type**.
 45   AS   ss
 ```
 
-* `new_type` — any 1-2 character label you choose, must not collide with a
-  real GAFF type.
-* `parent_type` — the real GAFF type the new type is *derived from*.
-  Parameters are cloned from it. It may be omitted when the atom already
-  carries a usable GAFF type, but is **required** for atoms typed `DU`.
+* `new_type` — any 1–2 character label, as long as it is not a real GAFF type.
+  It is only a lookup key; giving an atom a unique type is what makes its
+  parameters privately fittable instead of shared with every similar atom.
+* `parent_type` — the existing type whose parameters are cloned. Optional when
+  the atom already carries a usable type; **required** for `DU` atoms.
 
 > **Why `DU` appears.** `antechamber` types an atom `DU` when it cannot assign
-> it — typically the in-flight proton of a transition state, which is bonded
-> to two heavy atoms at once. `DU` is a placeholder with no mass, radius or
-> parameters, so you must name a real parent yourself (`ho` for a transferring
-> hydroxyl proton).
+> one — typically the in-flight proton of a transition state, bonded to two
+> heavy atoms at once. `DU` has no mass, radius or parameters, so you must name
+> a real parent yourself (`ho` for a transferring hydroxyl proton). The script
+> stops with an explicit message if you forget.
 
 ---
 
-## Step 1 — assign the atom types
+## What it does
 
-### With published parameters for part of the molecule
-
-```bash
-python $TOOLS/map_published.py \
-    --target MOL_resp.mol2 \
-    --template PUB.lib --frcmod frcmod.PUB \
-    --merge sel.txt \
-    --out sel_full.txt
+```
+1. match each --published template against your structure, adopt its types
+2. apply --sel on top (always wins)
+3. run parmchk2 on an all-GAFF copy -> gap-fills
+4. generate every term the new types touch
+5. write ONE frcmod + the re-typed mol2, verify with tleap
 ```
 
-**How it works.** The published template and your molecule are compared as
-*graphs* (elements + bonds), and the largest common substructure is found.
-Every matched atom inherits the template's atom type. Nothing depends on atom
-numbering, naming or ordering, so the same command works on any structure of
-the same fragment.
+### 1. Published types, by structure matching
+
+The template and your molecule are compared as **graphs** (elements + bonds)
+and the largest common substructure is found; every matched atom inherits the
+template's type. Atom numbering, naming and ordering are irrelevant, so the
+same command works on any structure of the same fragment.
 
 Matching (rather than exact isomorphism) is necessary because your model is
 usually a **truncation** of the published molecule — you keep one ring, the
-published library holds the entire cofactor.
+published library holds the whole cofactor.
 
-**Where the transfer stops.** `--frcmod` restricts adoption to types the
-parameter file actually *defines* (has a `MASS` entry for). Published files
-often reference types they do not define — those belong to a protein force
-field, not to the fragment — so this rule makes the transfer end exactly at
-the parameterised region and leaves the junction atom on GAFF.
+**Where the transfer stops:** only types the published frcmod *defines* (has a
+`MASS` entry for) are adopted. Published sets routinely reference types they do
+not define, because those belong to a protein force field; this rule ends the
+transfer at the parameterised region and leaves the junction on GAFF.
 
-**Layering.** `--merge sel.txt` is applied **last and wins**. If a reactive
-atom lies inside the published fragment, it takes the **published type as its
-parent** (unless you wrote an explicit parent), so its parameters are cloned
-from published values rather than from GAFF.
+To adopt those host-force-field types as well, source the force field that
+defines them when verifying:
 
-Repeat `--template`/`--frcmod` for several published sets.
-
-**Read the printed mapping before continuing** — it is the review step:
-
-```
-PUB.lib: matched 29 atoms, adopted 16 published types
-25 atoms re-typed: 16 published, 9 custom
+```bash
+--leaprc leaprc.protein.ff19SB
 ```
 
-### Reactive atoms only (no published set)
+### 2. Custom types on top
 
-Skip this step and use your `sel.txt` directly as the selection file in
-step 3.
+`--sel` is applied last and wins. A reactive atom inside a published fragment
+takes the **published type as its parent**, so its parameters are cloned from
+the published values rather than from GAFF — isolation without losing the
+published physics.
+
+### 3. GAFF gaps, handled silently
+
+**This is the step that used to bite.** GAFF does not cover everything. The
+subtypes `c5`/`c6` (sp3 carbons in 5- and 6-membered rings) have **no wildcard
+torsions** — there is no `X-c5-c5-X` the way there is `X-c3-c3-X` — so any
+sugar or saturated ring produces a pile of
+
+```
+** No torsion terms for atom types: h1-c5-c5-oh
+```
+
+errors in tleap, an empty prmtop, and then empty Hessians and `inf` scores in
+the optimiser, far from the real cause.
+
+`parmchk2` fills those gaps by falling back to the generic type
+(`same as X-c3-c3-X, penalty score= 0.0`). The script runs it internally and
+folds the result into the output, so the problem never reaches you and there is
+only one file to carry.
+
+> Note the physics: the ring-strain benefit of `c5` survives in bonds and
+> angles, but its torsions revert to acyclic `c3` values. If ring puckering
+> matters for your reaction, those are the weakest terms in the force field.
+
+### 4. Parameter sources, in priority order
+
+1. **published frcmod** — used verbatim, no geometry override
+2. **parmchk2 gap-fills** — including junction terms GAFF has no analog for
+3. **gaff2.dat** — everything else, cloned via each atom's parent type
+
+Terms straddling two schemes (a published type bonded to a custom type whose
+parent is published) are found by trying every combination of each atom's
+effective and parent type.
+
+Independently: if an analog exists but your geometry deviates from it
+(> 0.08 Å, > 12°), the equilibrium value is taken from **your TS geometry** and
+the force constant is demoted to a seed. That is how a partial bond keeps its
+stretched length.
+
+### 5. Output
+
+| file | contents |
+|---|---|
+| `MOL.mol2` | re-typed structure — coordinates, names and charges byte-identical to the input |
+| `MOL.frcmod` | the complete force field, self-contained |
+| `MOL.frcmod.review` | every seeded term, for the optimiser's parameter selection |
+
+tleap then runs automatically and must report `Errors = 0`. Use `--no-verify`
+to skip it.
 
 ---
 
-## Step 2 — fill the GAFF gaps
-
-```bash
-sed 's/ DU / ho /' MOL_resp.mol2 > MOL_gaff.mol2
-```
-
-```bash
-parmchk2 -i MOL_gaff.mol2 -f mol2 -o base.frcmod -s gaff2
-```
-
-**Why a separate copy.** `parmchk2` only understands GAFF types. It fails on
-your custom types, on published types, and on `DU`. So it is run on an
-all-GAFF copy of the *same* molecule; the parameters it finds are keyed by
-GAFF type and apply to the re-typed system just as well. `DU` and `ho` are
-both two characters, so column alignment is preserved. `MOL_gaff.mol2` is
-scratch — nothing else reads it.
-
-This step must come **before** step 3, which uses `base.frcmod` as a
-parameter source.
-
----
-
-## Step 3 — re-type and build the frcmod
-
-```bash
-python $TOOLS/clone_atom_types.py \
-    --mol2 MOL_resp.mol2 --sel sel_full.txt --gaff $GAFF \
-    --params frcmod.PUB --params base.frcmod \
-    --out-mol2 MOL_ts.mol2 --out-frcmod MOL_ts.frcmod
-```
-
-Outputs `MOL_ts.mol2` (re-typed) and `MOL_ts.frcmod` (every `MASS`, `BOND`,
-`ANGLE`, `DIHE` and `NONBON` term the new types touch), plus a
-`MOL_ts.frcmod.review` sidecar.
-
-**Parameter sources, in priority order:**
-
-1. `frcmod.PUB` — published values, used **verbatim** (no geometry override)
-2. `base.frcmod` — `parmchk2` gap-fills; needed for **junction** terms between
-   the published fragment and the GAFF remainder, which `gaff2.dat` has no
-   analog for
-3. `gaff2.dat` — everything else, cloned via each atom's parent type
-
-**How each term is decided:**
-
-* has an analog, geometry close to it → clone force constant *and* equilibrium
-* has an analog, geometry **far** from it (bond > 0.08 Å, angle > 12°) → the
-  coordinate is *reactive*: keep the equilibrium from your TS geometry, clone
-  the force constant as a **seed**, and log it
-* no analog at all → equilibrium from geometry, force constant is a default
-  **seed**, torsions become zero-barrier placeholders, and it is logged
-
-The `.mol2` is rewritten by substituting **only** the atom-type field, so
-coordinates, names and charges keep their exact original columns.
-
-> **A `parmchk2` trap.** `parmchk2` writes zero-valued placeholders marked
-> `ATTN, need revision` for terms it cannot determine — including anything
-> touching your in-flight proton. Used as a cloning source these would
-> silently zero a reactive force constant, so `clone_atom_types.py` skips any
-> line carrying that marker.
-
----
-
-## Step 4 — verify with tleap
-
-```bash
-printf 'source leaprc.gaff2\nloadamberparams base.frcmod\nloadamberparams frcmod.PUB\nloadamberparams MOL_ts.frcmod\nmol = loadmol2 MOL_ts.mol2\nsaveamberparm mol prmtop inpcrd\nquit\n' > tleap.in
-```
-
-```bash
-tleap -f tleap.in
-```
-
-Load order matters — general GAFF2 first, then the gap-fills, then the
-published set, then your own frcmod (later definitions win).
-
-**Required result:**
-
-```
-Exiting LEaP: Errors = 0; Warnings = 0; Notes = 0.
-```
-
-If tleap reports a missing **improper**, add it to `MOL_ts.frcmod` by hand —
-impropers are not generated automatically, because GAFF wild-cards most of
-them and the rare exception is easier to add than to predict.
-
----
-
-## Step 5 — check the result
-
-Confirm the geometry and charges came through untouched:
-
-```bash
-awk '/@<TRIPOS>ATOM/{a=1;next}/@<TRIPOS>BOND/{a=0}a{n++;s+=$9}END{printf "atoms=%d  sum(q)=%.4f\n",n,s}' MOL_ts.mol2
-```
-
-`sum(q)` must equal your net charge.
-
-Then read the review file:
-
-```bash
-cat MOL_ts.frcmod.review
-```
+## Reading the review file
 
 ```
 BOND  AO-BH: reactive, req=1.2705 from geometry (GAFF 0.9725); k=535.51 is a seed
-BOND  BH-OB: reactive, req=1.1459 from geometry (GAFF 0.9725); k=535.51 is a seed
-ANGLE AC-AO-BH: reactive, theta=120.11 from geometry (GAFF 107.39); k=65.13 is a seed
 ANGLE AO-BH-OB: NO GAFF analog; theta=171.84 from geometry, k=50.0 is a seed
 DIHE  AC-AO-BH-OB: NO GAFF analog; zero-barrier placeholder
 ```
 
-**This file is a checklist, not an error log.** It lists every parameter that
-is a *seed* — a placeholder rather than a derived value. Two kinds appear:
+**This is a checklist, not an error log.** Every line is a parameter that is a
+*seed* rather than a derived value:
 
-* **`reactive`** — a GAFF analog exists, but your geometry is far from it.
-  These are the forming/breaking coordinates: a partial bond stretched well
-  past a normal one, an angle opened toward linearity. The equilibrium value
-  is right (it comes from your QM geometry); the **force constant is not**.
+* **`reactive`** — an analog exists but your geometry is far from it. These are
+  the forming/breaking coordinates. The equilibrium value is right (it comes
+  from your QM geometry); the **force constant is not**.
 * **`NO GAFF analog`** — the term does not exist in GAFF at all, because the
   arrangement is impossible in a ground state (a hydrogen bonded to two heavy
-  atoms). Both the force constant and, for torsions, the barrier are
-  placeholders.
+  atoms). Force constant and torsion barrier are both placeholders.
 
-**Everything listed here must be selected in the optimizer's parameter file.**
-These force constants are exactly what the fit is supposed to determine; if
-they are not selected, the placeholder values survive into the final force
-field and the TSFF is wrong.
+**Every term listed here must be selected in the optimiser's parameter file.**
+These force constants are exactly what the fit determines; unselected, the
+placeholders survive into the final force field.
 
-Equally important: **nothing unexpected should appear in this list.** Entries
-should cluster around the reacting atoms. A seeded term somewhere else means
-a parameter failed to find an analog — investigate before optimizing.
+Equally important: **nothing unexpected should appear**. Entries should cluster
+around the reacting atoms. A seeded term elsewhere means a parameter found no
+analog — investigate before optimising.
 
 ---
 
-## Next — fit the seeded parameters
+## Options
 
-The force field is now tleap-ready, but every term in the `.review` file is
-still a placeholder. [`../OPTIMIZATION.md`](../OPTIMIZATION.md) covers running
-the Q2MM fit against your QM reference — the parameter file, the `loop.in`
-command set, and the gradient (`GRAD`) and hybrid (`SWARM`) optimizers — plus
-the AmberTools patch required for `-ah` Hessian data.
+| flag | meaning |
+|---|---|
+| `-o, --out` | output prefix → `<out>.mol2`, `<out>.frcmod` |
+| `--sel` | custom/reactive atom types |
+| `--published TEMPLATE FRCMOD` | a published set; repeatable |
+| `--gaff` | `gaff2.dat` (default: found under `$AMBERHOME`) |
+| `--leaprc` | extra leaprc to source when verifying; repeatable |
+| `--no-verify` | skip the tleap check |
 
 ---
 
@@ -272,11 +207,19 @@ the AmberTools patch required for `-ah` Hessian data.
 
 | symptom | cause and fix |
 |---|---|
-| `atom N has parent 'DU'` | `DU` is a placeholder, not a type. Put a real GAFF parent in `sel.txt` (`ho` for a transferring hydroxyl proton). |
-| `no match for template` | the template is not the same fragment, or your molecule is missing part of it. Check the printed match count. |
-| adopted 0 published types | `--frcmod` defines none of the matched types. Confirm the frcmod has `MASS` entries for them. |
-| tleap: dozens of errors | `base.frcmod` missing or not loaded. Run step 2 and list it in `tleap.in`. |
-| tleap: `Unknown keyword` | an frcmod has extra text in its header. Only line 1 is a free-text title. |
-| many seeded junction terms | pass `--params base.frcmod` in step 3 as well. |
-| `type 'X' has no mass` | the parent type is not in `gaff2.dat` or in any `--params` file. Use a real parent. |
-| all bonds show order 1 in a viewer | cosmetic only — AMBER ignores mol2 bond orders and reads parameters from atom types. `antechamber` gives up on bond perception when a TS geometry has an atom with impossible valence. |
+| `atom N is typed DU but is not selected` | a `DU` atom has nothing to inherit. Add it to `sel.txt` with a real parent (`ho` for a transferring hydroxyl proton). |
+| `atom N has parent 'DU'` | you wrote `DU` as the parent. Use a real GAFF type. |
+| `did not match the structure` | the template is not the same fragment, or your model is missing part of it. Check the printed match count. |
+| `adopted 0 published types` | the frcmod defines none of the matched types. Confirm it has `MASS` entries for them. |
+| tleap reports a missing **improper** | impropers are not generated; add the rare one by hand. GAFF wild-cards most of them. |
+| `cannot find parmchk2` | `AMBERHOME` is not set, or `$AMBERHOME/bin` is not on `PATH`. |
+| all bonds show order 1 in a viewer | cosmetic only — AMBER reads parameters from atom types and ignores mol2 bond orders. `antechamber` gives up on bond perception when a TS geometry has an atom of impossible valence. |
+
+---
+
+## A note on row numbers
+
+The optimiser's parameter selection (`BandA_FC.txt` and friends) indexes
+**rows** in the frcmod. Because this script emits one merged file, its rows
+differ from the older two-file layout — regenerate any selection file built
+against the old split, or it will silently select the wrong parameters.
