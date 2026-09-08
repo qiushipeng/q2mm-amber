@@ -358,7 +358,10 @@ def fmt_dihe(t1, t2_, t3, t4, idivf, pk, phase, per):
 
 
 def fmt_nonbon(t, rstar, eps):
-    return "  {:<2}   {:>9.5f}   {:>9.5f}   0.00000".format(t, rstar, eps)
+    # AMBER's NONBON/MOD4 record is: type, R*, epsilon. Nothing else -- an
+    # extra trailing number lands in the part tleap ignores, which makes it
+    # look like a parameter while doing nothing.
+    return "  {:<2}   {:>9.5f}   {:>9.5f}".format(t, rstar, eps)
 
 ATOMIC_NUMBER = {1: "H", 6: "C", 7: "N", 8: "O", 9: "F", 15: "P", 16: "S",
                  17: "Cl", 35: "Br", 53: "I"}
@@ -601,24 +604,96 @@ FRC_ALIASES = {"MASS": "MASS", "BOND": "BOND", "ANGLE": "ANGLE",
 # width of the "a-b-c-d" type field, per section; None = key on the first token
 KEY_WIDTH = {"MASS": None, "NONBON": None,
              "BOND": 5, "ANGLE": 8, "DIHE": 11, "IMPROPER": 11}
+# How many numbers a well-formed record carries. Real frcmods in the wild also
+# contain lines that do not fit (odd IMPROPER variants, LJEDIT-style rows, stray
+# text); those are passed through byte-for-byte instead of being reformatted, so
+# nothing is ever lost or silently altered.
+EXPECTED_NUMBERS = {"MASS": (1, 2), "BOND": (2,), "ANGLE": (2,),
+                    "DIHE": (4,), "IMPROPER": (3,), "NONBON": (2, 3)}
 
 
-def frc_key(section, line):
-    w = KEY_WIDTH[section]
-    return line.split()[0] if w is None else line[:w]
+def frc_parse(section, line):
+    """Split a frcmod line into (canonical key, number TEXTS, comment, raw line).
+
+    The numbers are kept as their original strings and never re-formatted:
+    re-printing them at a fixed number of decimals silently truncates published
+    parameters (a vdW epsilon of 5e-06 becomes 0.0), so columns are aligned by
+    padding the original text instead.
+
+    For BOND/ANGLE/DIHE/IMPROPER the type field is fixed-width in AMBER (two
+    characters per type joined by '-') and is re-padded to canonical form. For
+    MASS/NONBON the key is a single type and is left alone -- ionic types such
+    as `F-`, `Cl-` and `Na+` contain characters that must not be treated as
+    separators."""
+    width = KEY_WIDTH[section]
+    if width is None:
+        tokens = line.split()
+        key, rest = tokens[0], tokens[1:]
+    else:
+        raw_key, rest = line[:width], line[width:].split()
+        key = "-".join("{:<2}".format(p.strip()) for p in raw_key.split("-"))
+    numbers, comment = [], []
+    for token in rest:
+        if not comment:
+            try:
+                float(token)
+                numbers.append(token)          # keep the exact original text
+                continue
+            except ValueError:
+                pass
+        comment.append(token)
+    return key, numbers, " ".join(comment), line
 
 
-def frc_types(section, line):
-    """The atom types a frcmod line refers to."""
+def frc_types(section, key):
+    """The atom types a key refers to."""
     if KEY_WIDTH[section] is None:
-        return [line.split()[0]]
-    return [t.strip() for t in frc_key(section, line).split("-")]
+        return [key]                           # a single type, hyphens and all
+    return [t.strip() for t in key.split("-")]
+
+
+def frc_render(section, key, numbers, comment, raw):
+    """One column-aligned frcmod line, with every value bit-preserved.
+
+    A record whose number count is not what the section expects is returned
+    exactly as it came in: better an unaligned line than a mangled parameter."""
+    if len(numbers) not in EXPECTED_NUMBERS[section]:
+        return raw
+    # Every column is preceded by its own space, so a value that fills the
+    # field width cannot run into its neighbour (parameters like -0.68404904
+    # are exactly as wide as the column).
+    if section == "NONBON":
+        # AMBER reads type, R*, epsilon and ignores the rest of the line, so a
+        # third column is dropped rather than carried as a phantom parameter.
+        used = numbers[:2]
+        text = "  {:<4}{}".format(key, "".join(" {:>11}".format(n)
+                                               for n in used))
+    elif section == "MASS":
+        text = "{:<4}{}".format(key, "".join(" {:>10}".format(n)
+                                             for n in numbers))
+    else:
+        text = "{:<{w}}{}".format(key, "".join(" {:>10}".format(n)
+                                               for n in numbers),
+                                  w=KEY_WIDTH[section])
+    return text + ("   " + comment if comment else "")
+
+
+def looks_like_header(stripped):
+    """A bare all-caps word on its own line starts a section."""
+    return (stripped.isupper() and stripped.replace("_", "").isalpha()
+            and len(stripped.split()) == 1)
 
 
 def frc_sections(text):
-    """{section: OrderedDict(key -> [raw lines])}; the title line is dropped."""
-    out = OrderedDict((s, OrderedDict()) for s in FRC_SECTIONS)
-    section = None
+    """(sections, extras) for one frcmod.
+
+    sections: {section: OrderedDict(key -> [(numbers, comment, raw), ...])}
+    extras:   [(header, [raw lines])] for sections this tool does not model
+              (LJEDIT, CMAP, ...), carried through verbatim so a published
+              parameter file is never silently truncated.
+    """
+    sections = OrderedDict((s, OrderedDict()) for s in FRC_SECTIONS)
+    extras, current, extra_block = [], None, None
     for raw in text.splitlines():
         line = raw.rstrip("\n")
         stripped = line.strip()
@@ -626,12 +701,20 @@ def frc_sections(text):
             continue
         upper = stripped.upper()
         if upper in FRC_ALIASES:
-            section = FRC_ALIASES[upper]
+            current, extra_block = FRC_ALIASES[upper], None
             continue
-        if section is None:
+        if looks_like_header(stripped):
+            current, extra_block = None, (stripped, [])
+            extras.append(extra_block)
             continue
-        out[section].setdefault(frc_key(section, line), []).append(line)
-    return out
+        if extra_block is not None:
+            extra_block[1].append(line)
+            continue
+        if current is None:
+            continue                       # the title line
+        key, numbers, comment, raw_line = frc_parse(current, line)
+        sections[current].setdefault(key, []).append((numbers, comment, raw_line))
+    return sections, extras
 
 
 def frc_merge(target, source, keep_types=None):
@@ -641,21 +724,26 @@ def frc_merge(target, source, keep_types=None):
     actually contain -- that is what stops a published frcmod from dragging in
     parameters for the parts of the cofactor you did not model."""
     for section, entries in source.items():
-        for key, lines in entries.items():
+        for key, records in entries.items():
             if keep_types is not None:
-                types = frc_types(section, lines[0])
-                if not all(t in keep_types or t == "X" or t == "" for t in types):
+                if not all(t in keep_types or t in ("X", "")
+                           for t in frc_types(section, key)):
                     continue
-            target[section][key] = lines
+            target[section][key] = records
     return target
 
 
-def frc_write(path, title, sections):
+def frc_write(path, title, sections, extras=()):
     out = [title]
     for section in FRC_SECTIONS:
         out.append(section)
-        for lines in sections[section].values():
-            out.extend(lines)
+        for key, records in sections[section].items():
+            for numbers, comment, raw in records:
+                out.append(frc_render(section, key, numbers, comment, raw))
+        out.append("")
+    for header, body in extras:
+        out.append(header)
+        out.extend(body)
         out.append("")
     with open(path, "w") as fh:
         fh.write("\n".join(out) + "\n")
@@ -1039,21 +1127,24 @@ def main(argv=None):
 
         # ---- 6. one frcmod: gap-fills + published + generated --------------
         present = set(otype.values())
-        sections = frc_sections(base_text)
+        sections, extras = frc_sections(base_text)
         for pf in pub_frcmods:
-            frc_merge(sections, frc_sections(open(pf).read()), keep_types=present)
+            pub_sections, pub_extras = frc_sections(open(pf).read())
+            frc_merge(sections, pub_sections, keep_types=present)
+            extras.extend(pub_extras)
         generated = OrderedDict((s, OrderedDict()) for s in FRC_SECTIONS)
         for section, produced in (("MASS", mass_lines), ("BOND", bond_lines),
                                   ("ANGLE", angle_lines), ("DIHE", dihe_lines),
                                   ("NONBON", nonbon_lines)):
             for line in produced:
-                generated[section].setdefault(frc_key(section, line),
-                                              []).append(line)
+                key, numbers, comment, raw = frc_parse(section, line)
+                generated[section].setdefault(key, []).append(
+                    (numbers, comment, raw))
         frc_merge(sections, generated)
 
         title = "TSFF (build_tsff.py) | new types: " + ", ".join(
             "{}<-{}".format(nt, p) for nt, p in newtypes.items())
-        total = frc_write(out_frcmod, title, sections)
+        total = frc_write(out_frcmod, title, sections, extras)
 
         # ---- 7. the re-typed structure -------------------------------------
         write_mol2(out_mol2, lines, atom_tokens, atom_line_idx, sel)
