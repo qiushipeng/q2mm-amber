@@ -47,6 +47,7 @@ import glob
 import logging
 import logging.config
 import os
+import pickle
 import re
 import shutil
 import sys
@@ -322,7 +323,40 @@ class Loop(object):
             args_ref=self.args_ref,
             **kwargs
         )
-        self.ff = swarm.run(ref_data=self.ref_data)
+        try:
+            self.ff = swarm.run(ref_data=self.ref_data)
+        finally:
+            self._dump_swarm_history(swarm)
+
+    def _dump_swarm_history(self, swarm):
+        """Persist the swarm history to hybrid_opt_history.bin.
+
+        PSO_DE accumulates every particle position (X) and score (Y) per
+        iteration in record_value, but nothing else writes it to disk, so
+        without this the whole history dies with the process. Written in a
+        `finally` so a crashed or interrupted run still leaves the partial
+        history behind.
+        """
+        if swarm.hybrid_opt is None:
+            logger.warning("SWARM: no optimizer to dump history from")
+            return
+        history = swarm.hybrid_opt.record_value
+        # record_value starts as {"X": [], "V": [], "Y": []}, so test X rather
+        # than the dict itself. Writing a history with no iterations would
+        # produce a file that indexing X[0]/Y[0] then blows up on.
+        if not history["X"]:
+            logger.warning("SWARM: optimizer recorded no iterations")
+            return
+        path = os.path.join(self.direc, "hybrid_opt_history.bin")
+        try:
+            with open(path, "wb") as fh:
+                pickle.dump(history, fh)
+        except Exception as e:
+            # Never let a failed dump take down an otherwise good run.
+            logger.warning("SWARM: could not write %s: %s", path, e)
+            return
+        logger.log(20, "SWARM history: {} records -> {}".format(
+            len(history["X"]), path))
 
 
 # ---------------------------------------------------------------------------

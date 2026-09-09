@@ -443,6 +443,10 @@ class SwarmOptimizer(Optimizer):
         # a multiprocessing.Pool with per-particle isolated working dirs so
         # concurrent tleap/sander/nab runs don't clobber each other's files.
         self.n_processes = n_processes
+        # Set by run() as soon as the PSO_DE is built, so the caller can
+        # persist hybrid_opt.record_value (the swarm history) afterwards.
+        # Stays None if run() dies before the optimizer exists.
+        self.hybrid_opt = None
 
     @catch_run_errors
     def run(self, ref_data=None):
@@ -570,6 +574,9 @@ class SwarmOptimizer(Optimizer):
             pass_particle_num=False,
             verbose=True,
         )
+        # Publish before running: @catch_run_errors swallows exceptions, and
+        # a partial record_value is still worth writing out.
+        self.hybrid_opt = opt
         opt.Y = opt.cal_y()
         opt.update_pbest()
         opt.update_gbest()
