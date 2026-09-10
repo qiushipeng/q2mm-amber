@@ -1,20 +1,33 @@
 #!/usr/bin/env python3
 """
-Recover what swarm data survives a q2mm-amber SWARM run.
+Recover swarm data from a q2mm-amber SWARM run's log and particle dirs.
 
-The optimizer accumulates a full history in PSO_DE.record_value, but
-SwarmOptimizer.run() never persists it (see opt.py: `opt` is a local and
-loop.py's _handle_swarm has no pickle.dump). This script scrapes back what
-did reach disk:
+Two uses:
 
-  * gbest trajectory  -- from the per-iteration "Iter: N, Best fit: Y at [X]"
-                         lines root.log gets when verbose=True
-  * taper schedule    -- from the "cp: ... w: ... cg ..." lines
-  * last particle X   -- from swarm_particles/p_NNN/<ff>.frcmod, each of which
-                         holds that particle's LAST EVALUATED position
+1. Runs that predate the history dump. `loop.py._dump_swarm_history` now
+   writes `hybrid_opt_history.bin` at the end of every SWARM run, but runs
+   made before that change have no pickle at all. This is the only way to
+   get anything out of them.
 
-Not recoverable: per-iteration X and Y for the whole swarm, and pbest.
-Those only ever existed in memory.
+2. The gbest trajectory, which the pickle does NOT contain. `recorder()`
+   appends X and Y but *overwrites* best_x/best_y, so the history keeps only
+   the final best position. The verbose log records the best position at
+   every iteration, so the two sources are complementary.
+
+What it reads:
+
+  * gbest trajectory  -- the "Iter: N, Best fit: Y at [X]" lines root.log
+                         gets when PSO_DE runs with verbose=True
+  * taper schedule    -- the "cp: ... w: ... cg ..." lines
+  * last particle X   -- swarm_particles/p_NNN/<ff>.frcmod, each holding
+                         that particle's LAST EVALUATED position
+
+Note this parses the frcmod q2mm-amber *wrote*, whose columns are padded
+wider than a hand-made frcmod's; the fixed offset in parse_frcmod is safe
+for that layout but not for arbitrary input.
+
+Never recoverable from disk: per-iteration X and Y for the whole swarm (use
+the pickle) and pbest, which is never recorded anywhere.
 
 Usage:
     python3 extract_swarm.py <run_dir> [-o out.npz]
