@@ -14,22 +14,30 @@ FFLD read <path>          Import a force field (.frcmod -> AmberFF).
 FFLD write <path>         Export the current best force field.
 PARM <pfile>              Trim the FF parameters via parameters.py.
 RDAT <args ...>           Calculate reference data (calculate.main).
-CDAT <args ...>           Calculate FF data with current FF parameters.
+CDAT <args ...>           Build the Calculator for these arguments
+                          (calculate.build_calculator) and calculate FF
+                          data with the current FF parameters. The
+                          optimizers evaluate every trial FF through it.
 COMP [-o out] [-p]        Score reference vs calculated; write pretty table.
 LOOP <conv> ... END       Iterate the enclosed block until score change
                           < conv. Block typically contains GRAD, SIMP,
-                          or SWARM commands.
+                          or HYBR commands.
 GRAD [opts ...]           Run gradient.Gradient.run(). Options use the
                           old grammar, eg "lstsq=True,radii=[1./10.]".
 SIMP [max_params=N]       Run simplex.Simplex.run().
-SWARM [opts ...]          Run opt.SwarmOptimizer.run(). Options:
-                          max_iter=N pop_size=N precision=F tight=T|F
+HYBR [--max_iter N] [--pop_size N] [--tight T|F] [--n_processes N]
+                          Run one cycle of the hybrid PSO-DE optimizer
+                          (opt.SwarmOptimizer), as upstream q2mm's
+                          hybrid-opt branch does: inside a LOOP block the
+                          swarm persists from cycle to cycle, the LOOP's
+                          convergence is also the swarm's own precision,
+                          and a new LOOP block starts a new swarm.
 WGHT <typ> <weight>       Override constants.WEIGHTS[typ] (eg "WGHT b 100.").
 STEP <ptype> <step>       Override constants.STEPS[ptype].
 FXATM <file>              Exclude fixed atoms from the Hessian fit. <file>
                           lists one 1-based atom index per line; Hessian
                           elements coupling those atoms get weight 0. Put it
-                          before COMP/SWARM so the exclusion is in effect.
+                          before COMP/HYBR so the exclusion is in effect.
 END                       Terminates an inner LOOP block (no-op outside).
 
 Usage
@@ -53,9 +61,9 @@ import shutil
 import sys
 
 import constants as co
-import data_structs
 import parameters as parameters_module
 import score
+from utilities import AmberUtilities
 
 logging.config.dictConfig(co.LOG_SETTINGS)
 logger = logging.getLogger(__file__)
@@ -81,6 +89,20 @@ class Loop(object):
         self.args_ref = None
         self.loop_lines = None
         self.ref_data = None
+        self.calculator = None
+        # The swarm of the HYBR command, kept across the cycles of one LOOP
+        # block (upstream q2mm logic) and dropped when the block ends.
+        self.swarm = None
+
+    def _get_calculator(self):
+        """The Calculator built at CDAT, or one built now from the CDAT args."""
+        if self.calculator is None:
+            if not self.args_ff:
+                raise ValueError("CDAT must precede the optimizer commands so a "
+                                 "calculator can be built from its arguments.")
+            import calculate
+            self.calculator = calculate.build_calculator(self.args_ff, ff=self.ff)
+        return self.calculator
 
     # -- inner LOOP block ----------------------------------------------------
 
@@ -88,19 +110,15 @@ class Loop(object):
         """
         Execute the inner LOOP / END block repeatedly until
         |last_score - new_score| / last_score < self.convergence.
-        Backs up the current best FF to mm3_NNN.fld after each cycle.
+        Backs up the current best FF to ff_NNN.frcmod after each cycle,
+        numbering on from any such files already in the directory.
         """
         change = None
         last_score = None
         if self.ff.score is None:
             logger.warning("No initial score; computing one to seed loop.")
-            import calculate
-            self.ff.export_ff()
-            self.ff.data = calculate.main(self.args_ff)
-            r_dict = score.data_by_type(self.ref_data)
-            c_dict = score.data_by_type(self.ff.data)
-            r_dict, c_dict = score.trim_data(r_dict, c_dict)
-            self.ff.score = score.compare_data(r_dict, c_dict)
+            self.ff.data = self._get_calculator().evaluate(self.ff)
+            self.ff.score = score.score_data(self.ref_data, self.ff.data)
 
         while last_score is None \
                 or change is None \
@@ -115,18 +133,19 @@ class Loop(object):
                 change = abs(last_score - new_score) / abs(last_score)
             pretty_loop_summary(self.cycle_num, new_score, change)
 
-            backup_files = glob.glob(os.path.join(self.direc, "mm3_???.fld"))
+            backup_files = glob.glob(os.path.join(self.direc, "ff_???.frcmod"))
             if backup_files:
                 backup_files.sort()
-                last_num = int(os.path.basename(backup_files[-1])[4:7])
-                backup = os.path.join(self.direc, "mm3_{:03d}.fld".format(last_num + 1))
+                last_num = int(os.path.basename(backup_files[-1])[3:6])
+                backup = os.path.join(self.direc, "ff_{:03d}.frcmod".format(last_num + 1))
             else:
-                backup = os.path.join(self.direc, "mm3_001.fld")
-            self.ff.export_ff(path=backup)
+                backup = os.path.join(self.direc, "ff_001.frcmod")
+            AmberUtilities.write_frcmod(self.ff, backup)
             logger.log(20, "  -- Wrote best FF to {}".format(backup))
 
         for p in self.ff.params:
             p.value_at_limits()
+        self.swarm = None
         return self.ff
 
     # -- top-level command interpreter --------------------------------------
@@ -171,8 +190,8 @@ class Loop(object):
                 logger.log(20, "~~ CALCULATING FF DATA ~~".rjust(79, "~"))
                 if len(cols) > 1:
                     self.args_ff = " ".join(cols[1:]).split()
-                import calculate
-                self.ff.data = calculate.main(self.args_ff)
+                    self.calculator = None
+                self.ff.data = self._get_calculator().evaluate(self.ff)
 
             elif cmd == "COMP":
                 self._handle_comp(cols)
@@ -190,6 +209,7 @@ class Loop(object):
                 inner_loop.args_ff = self.args_ff
                 inner_loop.args_ref = self.args_ref
                 inner_loop.ref_data = self.ref_data
+                inner_loop.calculator = self.calculator
                 inner_loop.loop_lines = inner
                 pretty_loop_input(inner, name="OPTIMIZATION LOOP",
                                   score=self.ff.score)
@@ -201,8 +221,8 @@ class Loop(object):
             elif cmd == "SIMP":
                 self._handle_simp(cols)
 
-            elif cmd == "SWARM":
-                self._handle_swarm(cols)
+            elif cmd == "HYBR":
+                self._handle_hybr(cols)
 
             elif cmd == "WGHT":
                 co.WEIGHTS[cols[1]] = float(cols[2])
@@ -245,18 +265,17 @@ class Loop(object):
                 else:
                     shutil.copyfile(full, orig)
                     logger.log(20, "FFLD read: saved original FF backup to {}".format(orig))
-                self.ff = data_structs.AmberFF(full)
+                self.ff = AmberUtilities.read_frcmod(full)
             else:
                 raise ValueError(
                     "Only frcmod FFs supported in q2mm-amber-main "
                     "(saw {}).".format(target))
-            self.ff.import_ff()
             self.ff.method = "READ"
-            with open(full, "r") as f:
-                self.ff.lines = f.readlines()
+            # A calculator built for an earlier FF would write on its lines.
+            self.calculator = None
             logger.log(20, "FFLD read {}: {} parameters".format(full, len(self.ff.params)))
         elif action == "write":
-            self.ff.export_ff(full)
+            AmberUtilities.write_frcmod(self.ff, full)
             logger.log(20, "FFLD write {}".format(full))
         else:
             raise ValueError("FFLD: unknown action {}".format(action))
@@ -268,11 +287,8 @@ class Loop(object):
             out = os.path.join(self.direc, cols[cols.index("-o") + 1])
         if "-p" in cols:
             do_print = True
-        r_dict = score.data_by_type(self.ref_data)
-        c_dict = score.data_by_type(self.ff.data)
-        r_dict, c_dict = score.trim_data(r_dict, c_dict)
-        self.ff.score = score.compare_data(
-            r_dict, c_dict, output=out, doprint=do_print)
+        self.ff.score = score.score_data(
+            self.ref_data, self.ff.data, output=out, doprint=do_print)
         logger.log(20, "COMP score: {}".format(self.ff.score))
 
     def _handle_grad(self, cols):
@@ -280,7 +296,7 @@ class Loop(object):
         grad = gradient.Gradient(
             direc=self.direc, ff=self.ff,
             ff_lines=self.ff.lines, args_ff=self.args_ff,
-            args_ref=self.args_ref,
+            args_ref=self.args_ref, calculator=self._get_calculator(),
         )
         for opt_token in cols[1:]:
             _apply_method_token(grad, opt_token)
@@ -291,7 +307,7 @@ class Loop(object):
         simp = simplex.Simplex(
             direc=self.direc, ff=self.ff,
             ff_lines=self.ff.lines, args_ff=self.args_ff,
-            args_ref=self.args_ref,
+            args_ref=self.args_ref, calculator=self._get_calculator(),
         )
         for opt_token in cols[1:]:
             if "max_params" in opt_token:
@@ -300,33 +316,32 @@ class Loop(object):
                 raise ValueError("SIMP: unrecognised option '{}'".format(opt_token))
         self.ff = simp.run(r_data=self.ref_data)
 
-    def _handle_swarm(self, cols):
+    def _handle_hybr(self, cols):
         import opt as opt_module
-        kwargs = {}
-        for opt_token in cols[1:]:
-            if "=" not in opt_token:
-                continue
-            k, v = opt_token.split("=", 1)
-            if k == "max_iter":
-                kwargs["max_iter"] = int(v)
-            elif k == "pop_size":
-                kwargs["pop_size"] = int(v)
-            elif k == "precision":
-                kwargs["precision"] = float(v)
-            elif k == "tight":
-                kwargs["tight_spread"] = v.lower() in ("t", "true", "1", "yes")
-            elif k == "n_processes":
-                kwargs["n_processes"] = int(v)
-        swarm = opt_module.SwarmOptimizer(
-            direc=self.direc, ff=self.ff,
-            ff_lines=self.ff.lines, args_ff=self.args_ff,
-            args_ref=self.args_ref,
-            **kwargs
-        )
+        kwargs = parse_hybr_options(cols[1:])
+        if self.swarm is None:
+            # First HYBR of this LOOP block: a new swarm around the current
+            # FF, hyperparameters tapering over the cycle.
+            self.swarm = opt_module.SwarmOptimizer(
+                direc=self.direc, ff=self.ff,
+                ff_lines=self.ff.lines, args_ff=self.args_ff,
+                args_ref=self.args_ref, calculator=self._get_calculator(),
+                **kwargs
+            )
+            strategy = "exp_decay"
+        else:
+            # Later cycles continue the same swarm from where it stopped,
+            # around the best FF so far, with the hyperparameters frozen
+            # at their final values. The options were read when the swarm
+            # was created.
+            self.swarm.ff = self.ff
+            strategy = ""
         try:
-            self.ff = swarm.run(ref_data=self.ref_data)
+            self.ff = self.swarm.run(ref_data=self.ref_data,
+                                     precision=self.convergence,
+                                     strategy=strategy)
         finally:
-            self._dump_swarm_history(swarm)
+            self._dump_swarm_history(self.swarm)
 
     def _dump_swarm_history(self, swarm):
         """Persist the swarm history to hybrid_opt_history.bin.
@@ -338,14 +353,14 @@ class Loop(object):
         history behind.
         """
         if swarm.hybrid_opt is None:
-            logger.warning("SWARM: no optimizer to dump history from")
+            logger.warning("HYBR: no optimizer to dump history from")
             return
         history = swarm.hybrid_opt.record_value
         # record_value starts as {"X": [], "V": [], "Y": []}, so test X rather
         # than the dict itself. Writing a history with no iterations would
         # produce a file that indexing X[0]/Y[0] then blows up on.
         if not history["X"]:
-            logger.warning("SWARM: optimizer recorded no iterations")
+            logger.warning("HYBR: optimizer recorded no iterations")
             return
         path = os.path.join(self.direc, "hybrid_opt_history.bin")
         try:
@@ -353,10 +368,42 @@ class Loop(object):
                 pickle.dump(history, fh)
         except Exception as e:
             # Never let a failed dump take down an otherwise good run.
-            logger.warning("SWARM: could not write %s: %s", path, e)
+            logger.warning("HYBR: could not write %s: %s", path, e)
             return
-        logger.log(20, "SWARM history: {} records -> {}".format(
+        logger.log(20, "HYBR history: {} records -> {}".format(
             len(history["X"]), path))
+
+
+# ---------------------------------------------------------------------------
+# HYBR command option parsing
+# ---------------------------------------------------------------------------
+
+class _HybrOptionParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise ValueError("HYBR: {}".format(message))
+
+
+def parse_hybr_options(tokens):
+    """
+    Parse "--max_iter N --pop_size N --tight T|F --n_processes N" into
+    SwarmOptimizer keyword arguments. Every option is optional; an unknown
+    one is an error. The LOOP convergence, not an option, is the swarm's
+    precision.
+    """
+    parser = _HybrOptionParser(prog="HYBR", add_help=False)
+    parser.add_argument("--max_iter", type=int, default=200)
+    parser.add_argument("--pop_size", type=int, default=24)
+    parser.add_argument("--tight", type=str, default="true")
+    parser.add_argument("--n_processes", type=int, default=1)
+    opts, unknown = parser.parse_known_args(tokens)
+    if unknown:
+        raise ValueError("HYBR: unrecognised option(s) {}".format(" ".join(unknown)))
+    return {
+        "max_iter": opts.max_iter,
+        "pop_size": opts.pop_size,
+        "tight_spread": opts.tight.lower() in ("t", "true", "1", "yes"),
+        "n_processes": opts.n_processes,
+    }
 
 
 # ---------------------------------------------------------------------------

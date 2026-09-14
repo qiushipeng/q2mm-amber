@@ -439,7 +439,7 @@ COM_GAUSSIAN   = ['gaa','gaao','gab','gabo','gat','gato',
                   'gta','gtb','gtt','ge','ge1', 'gea', 'geo','ge1o', 'geao',
                   'gh', 'geigz']
 # Commands related to Amber.
-COM_AMBER      = ['ae','ae1','aeo','ae1o','abo','aao','ato','ah']
+COM_AMBER      = ['ae','ae1','aeo','ae1o','abo','aao','ato','ah','ageig']
 # All other commands.
 COM_OTHER = ['r']                           
 # All possible commands.

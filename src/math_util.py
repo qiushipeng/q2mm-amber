@@ -153,4 +153,77 @@ def invert_ts_curvature(hessian_matrix: np.ndarray, replace_with=5000) -> np.nda
 
     return inv_curv_hessian
 
+
+def replace_lowest_eigenvalue(eigenvalues: np.ndarray, value: float, label: str = "") -> np.ndarray:
+    """Returns a copy of `eigenvalues` with the most negative one, the
+    transition-state reaction coordinate, replaced by `value`. This is the -i
+    flag of calculate: the value is used as given, in the eigenvalues' own
+    units, and any other negative eigenvalues are left alone (unlike
+    replace_neg_eigenvalue, which zeroes them and converts units).
+
+    Use argmin(w), NOT argmin(|w|): a raw Hessian still carries ~0
+    translation/rotation modes, so smallest-magnitude would grab a rigid-body
+    mode and leave the real negative mode untouched.
+
+    Args:
+        eigenvalues (np.ndarray): eigenvalues, in any order
+        value (float): eigenvalue to put in place of the most negative one
+        label (str, optional): name of the source, for the warning
+
+    Returns:
+        np.ndarray: the eigenvalues with the replacement made
+    """
+    eigenvalues = np.array(eigenvalues, dtype=float)
+    index = int(np.argmin(eigenvalues))
+    if eigenvalues[index] >= 0.0:
+        logger.warning(
+            "invert requested but no negative eigenvalue in {} "
+            "(min eig {:.4g}); not a transition state?".format(label, eigenvalues[index]))
+    eigenvalues[index] = float(value)
+    return eigenvalues
+
+
+def invert_lowest_eigenvalue(hessian_matrix: np.ndarray, value: float, label: str = "") -> np.ndarray:
+    """Replaces the most negative eigenvalue of the Hessian with `value`
+    (see replace_lowest_eigenvalue) and reforms the matrix.
+
+    Args:
+        hessian_matrix (np.ndarray): symmetric Hessian matrix
+        value (float): eigenvalue to put in place of the most negative one
+        label (str, optional): name of the Hessian's source, for the warning
+
+    Returns:
+        np.ndarray: the reformed Hessian
+    """
+    eigenvalues, eigenvectors = decompose(hessian_matrix)
+    return reform_hessian(replace_lowest_eigenvalue(eigenvalues, value, label), eigenvectors)
+
+
+def project_hessian(hessian: np.ndarray, eigenvectors: np.ndarray) -> np.ndarray:
+    """The Hessian expressed in the basis of `eigenvectors`: V H V^T.
+
+    With the normalized, mass-weighted eigenvectors of the reference (QM)
+    Hessian as rows of V (one per normal mode, n_modes x 3N), the result is
+    the n_modes x n_modes "eigenmatrix" of eigenmode fitting: its diagonal is
+    the curvature of `hessian` along each QM mode and its off-diagonals the
+    coupling between modes. For the QM Hessian itself it is diag(eigenvalues);
+    a force-field Hessian that reproduced the QM one would give the same.
+
+    Args:
+        hessian (np.ndarray): 3N x 3N mass-weighted Hessian
+        eigenvectors (np.ndarray): n_modes x 3N, one eigenvector per row
+
+    Returns:
+        np.ndarray: n_modes x n_modes matrix
+
+    Raises:
+        ValueError: when the eigenvectors are not 3N long
+    """
+    eigenvectors = np.asarray(eigenvectors, dtype=float)
+    hessian = np.asarray(hessian, dtype=float)
+    if eigenvectors.ndim != 2 or hessian.ndim != 2 or eigenvectors.shape[1] != hessian.shape[0]:
+        raise ValueError("eigenvectors of shape {} cannot project a Hessian of shape {}".format(
+            eigenvectors.shape, hessian.shape))
+    return eigenvectors.dot(hessian).dot(eigenvectors.T)
+
 # endregion Hessian-specific

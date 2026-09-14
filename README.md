@@ -23,7 +23,7 @@ MM3\* (`mm3.fld`) and MacroModel. This package is the AMBER counterpart:
 | reference data | Jaguar / Gaussian | Gaussian |
 
 The command vocabulary (`DIR`, `FFLD`, `PARM`, `RDAT`, `CDAT`, `COMP`,
-`LOOP`/`END`, `GRAD`, `SIMP`) is deliberately the same as upstream, so loop
+`LOOP`/`END`, `GRAD`, `SIMP`, `HYBR`) is deliberately the same as upstream, so loop
 files and workflows read alike.
 
 ---
@@ -33,7 +33,7 @@ files and workflows read alike.
 | document | covers |
 |---|---|
 | **[`tools/README.md`](tools/README.md)** | **Start here.** Atom typing: turning a GAFF `mol2` into a tleap-ready TSFF (`map_published.py`, `clone_atom_types.py`) |
-| **[`OPTIMIZATION.md`](OPTIMIZATION.md)** | Running the fit: parameter files, `loop.in`, the `GRAD` and `SWARM` optimizers in full, the AmberTools patch |
+| **[`OPTIMIZATION.md`](OPTIMIZATION.md)** | Running the fit: parameter files, `loop.in`, Hessian and eigenmode fitting, the `GRAD` and `HYBR` optimizers in full, the AmberTools patch |
 
 ---
 
@@ -75,7 +75,7 @@ source $AMBERHOME/amber.sh
               |            => Seminario/FUERZA estimates
               |
    4. fit against QM  -------------------->  OPTIMIZATION.md
-        loop.py  +  GRAD / SIMP / SWARM
+        loop.py  +  GRAD / SIMP / HYBR
               |            => optimized frcmod
               |
    5. validate: MD with the TSFF
@@ -99,7 +99,7 @@ tleap -f MOL.in && ls -l calc/prmtop     # must be non-zero
 
 **2. Choose parameters to fit** (`params.txt`) — one per line,
 `ff_row ff_col lower upper`, where column 1 is a force constant and column 2 an
-equilibrium value. Bounds must be **finite** for `SWARM`:
+equilibrium value. Bounds must be **finite** for `HYBR`:
 
 ```
 49 1 10 1500
@@ -116,7 +116,9 @@ RDAT -gh MOL.log -i 1
 FXATM fixedatoms.txt          # optional: exclude QM-frozen atoms
 CDAT -ah MOL.in
 COMP -o start.txt
-SWARM max_iter=200 pop_size=24 tight=false n_processes=24
+LOOP 0.001
+HYBR --max_iter 200 --pop_size 24 --tight false --n_processes 24
+END
 FFLD write frcmod.gaff.01
 CDAT
 COMP -o opt.txt
@@ -146,10 +148,10 @@ score = sum over types (1 / N_type) * sum over points  w^2 * (reference - calcul
 |---|---|---|
 | `GRAD` | gradient least-squares (lagrange, newton, lstsq, levenberg, svd) | local, fast, precise near a good start; goes inside `LOOP … END` |
 | `SIMP` | simplex | local, small polish |
-| `SWARM` | particle swarm + differential evolution | global, slow, tolerates bad seeds; manages its own iterations |
+| `HYBR` | particle swarm + differential evolution | global, slow, tolerates bad seeds; goes inside `LOOP … END`, whose convergence also bounds the swarm |
 
 For a TSFF the forming/breaking coordinates start from placeholder seeds, so a
-`SWARM` pass is usually needed before `GRAD` can do useful work.
+`HYBR` pass is usually needed before `GRAD` can do useful work.
 
 ---
 
@@ -165,16 +167,16 @@ tools/        atom-typing helpers + documentation
 | module | role |
 |---|---|
 | `loop.py` | **entry point** — reads `loop.in` and dispatches every command |
-| `calculate.py` | builds reference (Gaussian) and calculated (Amber) data; Hessian handling, `-i` inversion, per-element weights |
-| `score.py` | the objective function (`compare_data`) and data trimming |
-| `opt.py` | optimizer base class + `SwarmOptimizer` (the `SWARM` adapter) |
+| `calculate.py` | the `RDAT`/`CDAT` command line: reference (Gaussian) data, and the factory that turns `CDAT` arguments into a `Calculator` |
+| `calculators.py` | `Calculator`, the interface between the optimizers and an MM engine (an `FF` in, `Datum` objects out); `AmberCalculator` runs tleap/sander/cpptraj/nab and owns the per-particle directories and worker pool of a parallel `HYBR` |
+| `score.py` | the objective function (`compare_data`), the per-type and per-element (Hessian) weights, data trimming |
+| `opt.py` | optimizer base class + `SwarmOptimizer` (the `HYBR` adapter) |
 | `hybrid_optimizer.py` | the `PSO_DE` engine (particle swarm + differential evolution) |
 | `gradient.py` | gradient optimizer (`GRAD`) |
 | `simplex.py` | simplex optimizer (`SIMP`) |
 | `parameters.py` | parameter selection / trimming (`PARM`) |
-| `data_structs.py` | `Datum`, `Param`, `AmberFF` and related types |
-| `utilities.py` | file I/O and the Amber pipeline driver (`AmberLeap`) |
-| `calculators.py` | data-extraction helpers |
+| `data_structs.py` | `Datum`, `Param`, `AmberFF`, `Structure` and related types, and the builders that turn a Hessian, geometry or energy into `Datum` objects |
+| `utilities.py` | file I/O: `AmberUtilities` (frcmod, sander/cpptraj/nab inputs and outputs), `Frcmod`, the Gaussian log and mol2 readers |
 | `math_util.py` | linear algebra |
 | `qfuerza.py` | Seminario/FUERZA force-constant estimation (standalone CLI) |
 | `constants.py` | weights, steps, unit conversions, logging config |
@@ -185,6 +187,16 @@ tools/        atom-typing helpers + documentation
 |---|---|
 | `map_published.py` | transfer published atom types onto your molecule by graph matching |
 | `clone_atom_types.py` | re-type selected atoms and generate the `frcmod` they require |
+
+### `tests/`
+
+Unit tests for the calculator, the file I/O and the optimizer-calculator
+contract. They need no Amber installation: a fake Amber (`tests/fake_amber.py`)
+writes the files each program would leave behind.
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ---
 
@@ -218,10 +230,11 @@ implementation](https://github.com/SGenheden/Seminario).
 
 Beyond the AMBER backend, this fork adds:
 
-* **`SWARM`** — the global hybrid PSO/DE optimizer from upstream's
-  [`hybrid-opt`](https://github.com/Q2MM/q2mm/tree/hybrid-opt) branch (where it
-  is the `HYBR` command), adapted to the AMBER backend with `key=value` options
-  and parallel evaluation in one working directory per particle.
+* **`HYBR`** — the global hybrid PSO/DE optimizer from upstream's
+  [`hybrid-opt`](https://github.com/Q2MM/q2mm/tree/hybrid-opt) branch, with
+  the same `LOOP`-driven logic, adapted to the AMBER backend with
+  `--name value` options and parallel evaluation in one working directory
+  per particle.
 * **`FXATM <file>`** — fixed atoms are supplied by a named file in `loop.in`
   rather than a hardcoded `fixedatoms.txt`, and the exclusion is applied at
   **score time**, so it works regardless of where the command sits. It zeroes
@@ -241,7 +254,7 @@ Beyond the AMBER backend, this fork adds:
 |---|---|
 | `Trimmed number of parameters down to 0` | the `frcmod` header is missing its flags. `# Q2MM` and `# OPT` must be on **separate** lines, in that order, before `MASS` — otherwise no parameters are read and nothing is fitted, silently. |
 | every score `0.0`, `Total Num. data points: 0` | `tleap` failed — check `calc/prmtop` is non-zero and read `leap.log`. Usually leftover `DU`/SYBYL atom types. |
-| `OverflowError: Range exceeds valid bounds` | a `SWARM` parameter has an infinite bound. `SWARM` needs finite `lower upper` on every line. |
+| `OverflowError: Range exceeds valid bounds` | a `HYBR` parameter has an infinite bound. `HYBR` needs finite `lower upper` on every line. |
 | score barely moves while parameters swing wildly | the objective is dominated by residuals the selected parameters cannot affect — classically a forming/breaking contact left **unbonded** in the `mol2`, which Amber scores as a nonbonded clash with an enormous Hessian element. Fix the topology, not the optimizer. |
 | `Hessian file missing: …hes` | AmberTools is not patched, or an earlier pipeline step failed. |
 | `FileExistsError: swarm_particles/p_000` | leftovers from a previous run; delete `swarm_particles/` first. |

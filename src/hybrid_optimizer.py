@@ -647,6 +647,14 @@ class PSO_DE(SkoBase):
         Returns:
             np.ndarray: resulting self.Y
         """
+        # A fitness marked mode="vectorization" (set_run_mode) takes the
+        # whole swarm and returns one value per particle; it manages any
+        # parallelism itself. q2mm's SwarmOptimizer works this way: its
+        # fitness hands the swarm to a Calculator, which runs the particles
+        # on its own worker pool.
+        if getattr(self.func_raw, "mode", None) == "vectorization":
+            self.Y = np.asarray(self.func_raw(self.X), dtype=float).reshape(-1, 1)
+            return self.Y
         # Short-circuit to a serial loop when n_processes <= 1: the Pool path
         # below would try to pickle self.func_raw, which for SwarmOptimizer is
         # a local closure over instance state (unpicklable). Serial is also

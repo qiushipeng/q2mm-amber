@@ -10,6 +10,10 @@ Contains:
     catch_run_errors     Decorator that returns the best FF if an exception
                          is raised inside an optimizer's run() method.
 
+Every optimizer talks to the MM engine through a calculators.Calculator: it
+hands over a data_structs.FF and gets back the Datum list to score, so no
+optimizer writes an engine file or runs a program itself.
+
 Helper functions used by gradient.py / simplex.py / loop.py:
     return_ref_data, calculate_radius, differentiate_params,
     differentiate_ff, cal_ff, param_derivs, pretty_param_changes,
@@ -22,7 +26,6 @@ import copy
 import logging
 import logging.config
 import os
-import shutil
 import textwrap
 
 import numpy as np
@@ -41,64 +44,26 @@ class OptError(Exception):
     pass
 
 
-# --- Parallel SWARM support ------------------------------------------------
+# --- Parallel HYBR support -------------------------------------------------
 #
-# multiprocessing.Pool.map pickles the callable per task, which means the
-# per-particle fitness has to be a *top-level* (picklable) function, not a
-# closure inside SwarmOptimizer.run. SwarmOptimizer.run stashes the state
-# workers need (FF template, ref data, per-particle dir list, args_ff
-# template) in this module-level dict BEFORE spawning the Pool; on Linux
-# fork, workers inherit it via memory copy-on-write.
-_SWARM_CONTEXT = None
+# Calculator.evaluate_many scores each particle inside the worker that ran
+# it, through a reducer that has to be a *top-level* (picklable) function.
+# SwarmOptimizer.run stashes the reference data here BEFORE the calculator
+# spawns its pool; on Linux fork, workers inherit it via memory
+# copy-on-write, so only a float travels back per particle.
+_REF_DATA = None
 
 
-def _swarm_particle_fitness(enumerable_input):
-    """
-    Picklable fitness function for parallel SWARM.
-
-    Each call:
-      1) picks the caller's per-particle working directory (indexed by the
-         particle number PSO_DE passes in as `enumerable_input[0]`),
-      2) writes the trial FF into that dir's frcmod,
-      3) runs Amber via the dir's local .in file,
-      4) scores against the reference data cached in _SWARM_CONTEXT.
-
-    Per-particle isolation means concurrent tleap/sander/nab runs don't
-    collide on shared calc/ files.
-    """
-    if isinstance(enumerable_input, tuple) and len(enumerable_input) == 2:
-        idx, params_vec = enumerable_input
-    else:
-        idx, params_vec = 0, enumerable_input
-    ctx = _SWARM_CONTEXT
-    particle_dir = ctx["dirs"][int(idx) % len(ctx["dirs"])]
-    ff_path = os.path.join(particle_dir, ctx["ff_basename"])
-    # Rewrite any .in path in args_ff to point at this particle's copy.
-    args_ff = list(ctx["args_ff_template"])
-    for i, tok in enumerate(args_ff):
-        if isinstance(tok, str) and tok.endswith(".in"):
-            args_ff[i] = os.path.join(particle_dir, os.path.basename(tok))
-    try:
-        trial_ff = copy.deepcopy(ctx["ff_template"])
-        trial_ff.set_param_values(params_vec)
-        trial_ff.export_ff(ff_path, lines=ctx["ff_lines"])
-        data = calculate.main(args_ff)
-        cdict = score.data_by_type(data)
-        rdict = score.data_by_type(ctx["ref_data"])
-        rdict, cdict = score.trim_data(rdict, cdict)
-        return score.compare_data(rdict, cdict)
-    except Exception as e:
-        # Never fail silently: a swallowed error here looks like a legitimate
-        # (very bad) score, and 24 workers can fail every iteration unnoticed.
-        logger.warning("SWARM particle %s failed in %s: %s", idx, particle_dir, e)
-        return float("inf")
+def _score_particle(data):
+    """Reducer for Calculator.evaluate_many: one particle's data -> score."""
+    return score.score_data(_REF_DATA, data)
 
 
 def catch_run_errors(func):
     """
     Decorator wrapping Optimizer.run(). If a known optimization error escapes,
-    fall back to the best FF found so far (or the initial FF) and write it
-    to disk before returning.
+    fall back to the best FF found so far (or the initial FF) and hand it to
+    the calculator, which writes it to disk, before returning.
     """
     def wrapper(*args, **kwargs):
         self = args[0]
@@ -110,12 +75,12 @@ def catch_run_errors(func):
             if getattr(self, "best_ff", None) is None:
                 logger.warning("Exiting {} and returning initial FF.".format(
                     self.__class__.__name__.lower()))
-                self.ff.export_ff(self.ff.path)
+                self.calculator.update_ff(self.ff)
                 return self.ff
             else:
                 logger.warning("Exiting {} and returning best FF.".format(
                     self.__class__.__name__.lower()))
-                self.best_ff.export_ff(self.best_ff.path)
+                self.calculator.update_ff(self.best_ff)
                 return self.best_ff
     return wrapper
 
@@ -135,13 +100,16 @@ class Optimizer(object):
     ff_lines : list[str] | None
         Lines of the FF file (used to reconstitute when writing).
     args_ff : list[str]
-        Arguments for calculate.main to produce FF data.
+        CDAT arguments; used to build a calculator when none is given.
     args_ref : list[str]
         Arguments for calculate.main to produce reference data.
+    calculator : calculators.Calculator | None
+        Evaluates trial force fields (calculator.evaluate(ff) -> Datum
+        list). Built from args_ff on first use when not given.
     """
 
     def __init__(self, direc=None, ff=None, ff_lines=None,
-                 args_ff=None, args_ref=None):
+                 args_ff=None, args_ref=None, calculator=None):
         logger.log(20, "~~ {} SETUP ~~".format(
             self.__class__.__name__.upper()).rjust(79, "~"))
         self.direc = direc
@@ -151,8 +119,21 @@ class Optimizer(object):
         self.args_ref = args_ref
         self.new_ffs = []
         self.best_ff = None
+        self._calculator = calculator
         if self.ff_lines is None and self.ff is not None and self.ff.lines:
             self.ff_lines = self.ff.lines
+
+    @property
+    def calculator(self):
+        if self._calculator is None:
+            if not self.args_ff:
+                raise OptError("No calculator and no CDAT arguments to build one from.")
+            self._calculator = calculate.build_calculator(self.args_ff, ff=self.ff)
+        return self._calculator
+
+    @calculator.setter
+    def calculator(self, value):
+        self._calculator = value
 
 
 def return_ref_data(args_ref):
@@ -254,19 +235,27 @@ def differentiate_ff(ff, central=True):
     return ffs
 
 
-def cal_ff(ff, ff_args, parent_ff=None, store_data=False):
+def trial_ff(template, values):
     """
-    Export an FF to disk, run calculate.main against it, and return
-    the resulting Datum list.
+    A lean copy of `template` carrying only what a Calculator needs to
+    evaluate it -- path and parameters, set to `values` -- and none of the
+    template's data, which would otherwise be deep-copied (and pickled to a
+    worker) once per particle.
+    """
+    ff = template.__class__()
+    ff.path = template.path
+    ff.params = copy.deepcopy(template.params)
+    ff.set_param_values(values)
+    return ff
+
+
+def cal_ff(ff, calculator, parent_ff=None, store_data=False):
+    """
+    Evaluate an FF with the calculator and return the resulting Datum list.
     """
     if ff.path is None and parent_ff is not None:
         ff.path = parent_ff.path
-    lines = parent_ff.lines if (parent_ff is not None and parent_ff.lines) else None
-    if lines is not None:
-        ff.export_ff(ff.path, lines=lines)
-    else:
-        ff.export_ff(ff.path)
-    data = calculate.main(ff_args)
+    data = calculator.evaluate(ff)
     if store_data:
         ff.data = data
     return data
@@ -399,22 +388,30 @@ def pretty_param_changes(params, changes, method=None, level=20):
 
 class SwarmOptimizer(Optimizer):
     """
-    Thin adapter that lets the LOOP command driver use the new hybrid
-    PSO-DE optimizer from hybrid_optimizer.py with the same constructor
-    signature as Gradient / Simplex.
+    Adapter that lets the loop.in HYBR command drive the hybrid PSO-DE
+    optimizer from hybrid_optimizer.py with the same constructor signature
+    as Gradient / Simplex. Follows the HYBR logic of upstream q2mm's
+    hybrid-opt branch:
 
-    The fitness function passed to PSO_DE is a closure that:
-      1) writes the candidate parameters into a deep-copied FF,
-      2) exports the FF to disk,
-      3) runs calculate.main(self.args_ff) to obtain calculated data,
-      4) returns score.compare_data(...) against the trimmed reference.
+    * The swarm is built by the first run() and kept: every later run()
+      continues the same particles from where they stopped. loop.py calls
+      run() once per cycle of the LOOP block holding the HYBR command and
+      starts a new SwarmOptimizer for a new block.
+    * The LOOP's convergence is passed in as `precision`, the swarm's own
+      early-stop tolerance (every particle within `precision` of the best
+      one, in every parameter, for 20 consecutive iterations).
+    * The PSO/DE hyperparameters taper from exploring to exploiting over
+      the first cycle (strategy "exp_decay"); continued cycles run with
+      them frozen at their final values (strategy "").
 
-    Notes
-    -----
-    Parallel execution (multiple AMBER calculations concurrently) requires
-    file-isolated working directories per particle. This serial fallback
-    runs one particle at a time but otherwise behaves correctly; set
-    `n_processes=1` (the default).
+    PSO_DE hands the whole swarm to the fitness function at once (one row
+    of parameter values per particle). The fitness:
+      1) turns every row into a trial FF (data_structs),
+      2) has the calculator evaluate them all -- in per-particle working
+         directories on a worker pool when n_processes > 1,
+      3) scores each particle's data against the reference inside the
+         worker that produced it (score.score_data),
+    and returns one score per particle.
     """
 
     DEFAULT_CONFIG = {
@@ -429,43 +426,45 @@ class SwarmOptimizer(Optimizer):
     }
 
     def __init__(self, direc=None, ff=None, ff_lines=None,
-                 args_ff=None, args_ref=None,
-                 max_iter=200, pop_size=24, precision=0.001,
-                 tight_spread=True, n_processes=1):
+                 args_ff=None, args_ref=None, calculator=None,
+                 max_iter=200, pop_size=24, tight_spread=True, n_processes=1):
         super(SwarmOptimizer, self).__init__(
             direc=direc, ff=ff, ff_lines=ff_lines,
-            args_ff=args_ff, args_ref=args_ref)
+            args_ff=args_ff, args_ref=args_ref, calculator=calculator)
         self.max_iter = max_iter
         self.pop_size = pop_size
-        self.precision = precision
         self.tight_spread = tight_spread
-        # n_processes = 1 -> serial (safe default). n_processes > 1 spawns
-        # a multiprocessing.Pool with per-particle isolated working dirs so
-        # concurrent tleap/sander/nab runs don't clobber each other's files.
+        # n_processes = 1 -> serial (safe default). n_processes > 1 has the
+        # calculator run the particles on a multiprocessing pool, each in
+        # its own copy of the working directory so concurrent
+        # tleap/sander/nab runs don't clobber each other's files.
         self.n_processes = n_processes
-        # Set by run() as soon as the PSO_DE is built, so the caller can
-        # persist hybrid_opt.record_value (the swarm history) afterwards.
-        # Stays None if run() dies before the optimizer exists.
+        # The PSO_DE, built by the first run() and continued by later ones.
+        # Its record_value is the swarm history loop.py persists. Stays
+        # None if run() dies before the optimizer exists.
         self.hybrid_opt = None
 
-    @catch_run_errors
-    def run(self, ref_data=None):
+    def _fitness(self):
+        """The batch fitness PSO_DE calls: swarm rows -> trial FFs -> calculator -> scores."""
+        pool_dir = os.path.join(self.direc, "swarm_particles")
+        n_processes = self.n_processes
+
+        def fitness(X):
+            ffs = [trial_ff(self.ff, row) for row in X]
+            scores = self.calculator.evaluate_many(
+                ffs, reducer=_score_particle, pool_dir=pool_dir,
+                n_processes=n_processes)
+            # A particle whose evaluation raised comes back as None: never
+            # a silent good score, so it is discarded as inf.
+            return [float("inf") if s is None else float(s) for s in scores]
+        # Tell PSO_DE the fitness takes the whole swarm (its own pool is
+        # bypassed; the calculator manages the workers).
+        fitness.mode = "vectorization"
+        return fitness
+
+    def _build(self):
+        """A PSO_DE around the current FF: bounds, starting spread, and the first evaluation of the swarm."""
         from hybrid_optimizer import PSO_DE, Bounds_Handler
-
-        if ref_data is None:
-            ref_data = return_ref_data(self.args_ref)
-        r_dict = score.data_by_type(ref_data)
-
-        # initial FF score
-        if self.ff.data is None:
-            self.ff.export_ff()
-            self.ff.data = calculate.main(self.args_ff)
-        c_dict = score.data_by_type(self.ff.data)
-        r_dict, c_dict = score.trim_data(r_dict, c_dict)
-        if self.ff.score is None:
-            self.ff.score = score.compare_data(r_dict, c_dict)
-        logger.log(20, "INIT FF SCORE: {}".format(self.ff.score))
-        pretty_ff_results(self.ff, level=20)
 
         # bounds + deviations for each parameter
         lb, ub, deviations = [], [], []
@@ -495,104 +494,76 @@ class SwarmOptimizer(Optimizer):
             "guess_ratio": 0.7 if self.tight_spread else 0.3,
             "bounds_strategy": Bounds_Handler.REFLECTIVE,
         })
-
-        # --- pick fitness callable: serial (closure) vs parallel (picklable
-        # module-level function that runs each particle in an isolated dir).
         if self.n_processes > 1:
-            # Build per-particle working dirs so concurrent workers don't
-            # collide on the shared frcmod / calc/ files.
-            base = os.path.join(self.direc, "swarm_particles")
-            os.makedirs(base, exist_ok=True)
-            # Locate the .in file (leap input) and mol2 in args_ff / near
-            # ff.path so we can copy them into each particle dir.
-            src_frcmod = self.ff.path
-            src_in = None
-            for tok in self.args_ff:
-                if isinstance(tok, str) and tok.endswith(".in"):
-                    src_in = tok
-                    break
-            src_mol2 = None
-            if src_in and os.path.isfile(src_in):
-                cand = os.path.join(os.path.dirname(src_in),
-                                    os.path.basename(src_in)[:-3] + ".mol2")
-                if os.path.isfile(cand):
-                    src_mol2 = cand
-            particle_dirs = []
-            for i in range(self.pop_size):
-                pd = os.path.join(base, "p_{:03d}".format(i))
-                os.makedirs(pd, exist_ok=True)
-                for src in (src_frcmod, src_in, src_mol2):
-                    if src and os.path.isfile(src):
-                        shutil.copyfile(
-                            src, os.path.join(pd, os.path.basename(src))
-                        )
-                particle_dirs.append(pd)
-            # Stash worker state on the module global BEFORE spawning Pool
-            # so Linux-fork workers inherit it.
-            global _SWARM_CONTEXT
-            _SWARM_CONTEXT = {
-                "dirs": particle_dirs,
-                "ff_template": self.ff,
-                "ff_basename": os.path.basename(self.ff.path),
-                "ff_lines": self.ff.lines,
-                "args_ff_template": list(self.args_ff),
-                "ref_data": ref_data,
-            }
-            fitness_callable = _swarm_particle_fitness
-            logger.log(
-                20,
-                "SWARM parallel: {} workers x {} particle dirs under {}".format(
-                    self.n_processes, len(particle_dirs), base
-                ),
-            )
-        else:
-            def fitness(enumerable_input):
-                # PSO_DE may pass either a bare array or (idx, array) when
-                # pass_particle_num=True; handle both.
-                if isinstance(enumerable_input, tuple) and len(enumerable_input) == 2:
-                    _, params_vec = enumerable_input
-                else:
-                    params_vec = enumerable_input
-                trial_ff = copy.deepcopy(self.ff)
-                trial_ff.set_param_values(params_vec)
-                try:
-                    trial_ff.export_ff(self.ff.path, lines=self.ff.lines)
-                    data = calculate.main(self.args_ff)
-                    cdict = score.data_by_type(data)
-                    rdict, cdict = score.trim_data(score.data_by_type(ref_data), cdict)
-                    return score.compare_data(rdict, cdict)
-                except Exception as e:
-                    logger.warning("Particle evaluation failed: {}".format(e))
-                    return float("inf")
-            fitness_callable = fitness
+            logger.log(20, "HYBR parallel: {} workers x {} particle dirs under {}".format(
+                self.n_processes, self.pop_size, os.path.join(self.direc, "swarm_particles")))
 
         opt = PSO_DE(
-            fitness_callable,
+            self._fitness(),
             len(self.ff.params),
             config=config,
             n_processes=self.n_processes,
             pass_particle_num=False,
             verbose=True,
         )
-        # Publish before running: @catch_run_errors swallows exceptions, and
-        # a partial record_value is still worth writing out.
+        # Publish before evaluating: @catch_run_errors swallows exceptions,
+        # and a partial record_value is still worth writing out.
         self.hybrid_opt = opt
         opt.Y = opt.cal_y()
         opt.update_pbest()
         opt.update_gbest()
         opt.recorder()
-        best_x, best_y = opt.run(precision=self.precision)
+        return opt
+
+    @catch_run_errors
+    def run(self, ref_data=None, precision=None, strategy="exp_decay"):
+        """
+        One cycle of max_iter swarm iterations.
+
+        precision : float | None
+            The swarm's early-stop tolerance; loop.py passes the LOOP's
+            convergence. None runs the full max_iter.
+        strategy : str
+            "exp_decay" tapers the PSO/DE hyperparameters over the cycle,
+            "" leaves them where they are (continued cycles).
+
+        Returns the best FF found so far when it beats self.ff, else self.ff;
+        the calculator writes the returned parameters to disk either way.
+        """
+        if ref_data is None:
+            ref_data = return_ref_data(self.args_ref)
+
+        # initial FF score
+        if self.ff.data is None:
+            self.ff.data = self.calculator.evaluate(self.ff)
+        if self.ff.score is None:
+            self.ff.score = score.score_data(ref_data, self.ff.data)
+        logger.log(20, "~~ HYBRID OPTIMIZATION ~~".rjust(79, "~"))
+        logger.log(20, "INIT FF SCORE: {}".format(self.ff.score))
+        pretty_ff_results(self.ff, level=20)
+
+        # Stash the reference data on the module global BEFORE the
+        # calculator spawns its pool so Linux-fork workers inherit it.
+        global _REF_DATA
+        _REF_DATA = ref_data
+
+        if self.hybrid_opt is None:
+            opt = self._build()
+        else:
+            logger.log(20, "  -- Continuing the swarm from the previous cycle.")
+            opt = self.hybrid_opt
+        best_x, best_y = opt.run(precision=precision, strategy=strategy)
 
         # build the best FF
         self.best_ff = copy.deepcopy(self.ff)
         self.best_ff.set_param_values(best_x)
         self.best_ff.score = best_y
-        self.best_ff.method = "SWARM"
+        self.best_ff.method = "HYBRID"
         if best_y < self.ff.score:
-            logger.log(20, "~~ SWARM FINISHED WITH IMPROVEMENTS ~~".rjust(79, "~"))
-            self.best_ff.export_ff(self.ff.path, lines=self.ff.lines)
+            logger.log(20, "~~ HYBRID FINISHED WITH IMPROVEMENTS ~~".rjust(79, "~"))
+            self.calculator.update_ff(self.best_ff)
             return self.best_ff
-        logger.log(20, "~~ SWARM FINISHED WITHOUT IMPROVEMENTS ~~".rjust(79, "~"))
+        logger.log(20, "~~ HYBRID FINISHED WITHOUT IMPROVEMENTS ~~".rjust(79, "~"))
         # restore initial parameters
-        self.ff.export_ff(self.ff.path, lines=self.ff.lines)
+        self.calculator.update_ff(self.ff)
         return self.ff

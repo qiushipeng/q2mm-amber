@@ -30,7 +30,7 @@ import logging.config
 import sys
 
 import constants as co
-from data_structs import AmberFF
+from utilities import AmberUtilities
 
 logging.config.dictConfig(co.LOG_SETTINGS)
 logger = logging.getLogger(__file__)
@@ -134,8 +134,7 @@ def main(args):
     parser = return_params_parser()
     opts = parser.parse_args(args)
 
-    ff = AmberFF(opts.ffpath)
-    ff.import_ff()
+    ff = AmberUtilities.read_frcmod(opts.ffpath)
 
     if opts.all:
         opts.ptypes = list(ALL_PARM_TYPES)

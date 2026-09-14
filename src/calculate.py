@@ -2,28 +2,43 @@
 """
 calculate
 ---------
-Reference / FF data extraction for q2mm-amber-main.
+Reference / FF data extraction for q2mm-amber.
 
-This module preserves the CLI signature used by the old q2mm-master
-calculate.py (so loop.in RDAT / CDAT lines continue to work). It:
+This module keeps the CLI signature of the old q2mm-master calculate.py, so
+loop.in RDAT / CDAT lines continue to work. It:
 
   1. parses a list of -flag/filename pairs (eg "-gh foo.log -i 1"),
-  2. for each file, instantiates the right utilities.File subclass,
-  3. runs the AMBER subprocess pipeline when the requested data type
-     requires it,
-  4. reads back the produced files and returns a flat list of
-     data_structs.Datum objects.
+  2. turns the Amber flags into calculators.AmberCalculator objects (one
+     per leap input), which run the Amber pipeline and read the results
+     back as Datum objects,
+  3. reads the Gaussian reference files here, with utilities.GaussLog,
+  4. returns a flat list of data_structs.Datum objects.
+
+The optimizers do not go through main(): loop.py builds one Calculator from
+the CDAT arguments with build_calculator() and hands it to them, and they
+evaluate a trial force field with calculator.evaluate(ff).
 
 Currently implemented data types
 --------------------------------
-Amber  : -ae, -ae1, -aeo, -ae1o, -abo, -aao, -ato, -ah
-Gaussian: -gh (Hessian as eigenmatrix), -ge, -ge1, -geo, -ge1o,
-          -gea, -geao, -gab, -gaa, -gat, -gabo, -gaao, -gato
+Amber   : -ah (Hessian), -ageig (Hessian projected on the QM normal modes,
+          "somename.in,somename.log"), -ae, -ae1, -aeo, -ae1o (energies),
+          -abo, -aao, -ato, -ab, -aa, -at (geometry)
+Gaussian: -gh (Hessian), -geigz (eigenmatrix: the QM eigenvalues on the
+          diagonal, zero elsewhere), -ge, -ge1, -geo, -ge1o (energies),
+          -gabo, -gaao, -gato (the mol2 geometry measured through Amber)
+
+Hessian fitting pairs -gh with -ah element by element; eigenmode fitting
+pairs -geigz with -ageig, comparing the force field's curvature along each
+QM normal mode (and the coupling between modes) with the QM eigenvalues.
+Both need the Gaussian job and the mol2 in the same Cartesian frame with the
+same atom order (run Gaussian with nosymm); eigenmode fitting also wants
+freq=hpmodes, since the modes are read from the printed normal coordinates.
 
 Anything else from the old code (MacroModel / Jaguar / Tinker) is
 parsed but ignored.
 
 main(args) -> list[Datum]
+build_calculator(args, ff=None) -> calculators.Calculator
 """
 from __future__ import absolute_import
 from __future__ import division
@@ -33,12 +48,15 @@ import logging
 import logging.config
 import os
 import sys
+from collections import OrderedDict
 
 import numpy as np
 
+import calculators
 import constants as co
+import math_util
 import score
-from data_structs import Datum
+from data_structs import Datum, datum_from_energy, datums_from_eigenmatrix, datums_from_hessian
 import utilities
 
 logging.config.dictConfig(co.LOG_SETTINGS)
@@ -52,7 +70,7 @@ logger = logging.getLogger(__file__)
 # instead of a hardcoded "fixedatoms.txt". The set lives in constants (co) so
 # both calculate and score can read it without a circular import, and the
 # exclusion is applied at SCORE time (score.compare_data) -- that makes it
-# placement-proof: FXATM only has to precede the COMP/SWARM that scores, not
+# placement-proof: FXATM only has to precede the COMP/HYBR that scores, not
 # the CDAT that built the data. co is a module global, so Linux-fork swarm
 # workers inherit it like the rest of the swarm's worker state.
 # ---------------------------------------------------------------------------
@@ -118,141 +136,81 @@ def return_calculate_parser(add_help=True, parents=None):
                             action="append", default=[])
     parser.add_argument("-r", type=str, nargs="+", action="append", default=[])
     for flag in ("ae", "ae1", "aeo", "ae1o",
-                 "abo", "aao", "ato", "ah", "aha"):
+                 "abo", "aao", "ato", "ab", "aa", "at", "ah", "aha"):
         parser.add_argument("-" + flag, type=str, nargs="+",
                             action="append", default=[])
+    parser.add_argument("-ageig", type=str, nargs="+", action="append", default=[],
+                        metavar="somename.in,somename.log",
+                        help="Amber Hessian projected on the Gaussian normal modes.")
     return parser
 
 
-# ---------------------------------------------------------------------------
-# Datum factories
-# ---------------------------------------------------------------------------
-
-def _datum_for_eigval(val, idx, src_filename):
-    return Datum(
-        val=float(val),
-        typ="eig",
-        src_1=src_filename,
-        idx_1=int(idx),
-        idx_2=int(idx),
-    )
+def _split_args(args):
+    if isinstance(args, str):
+        args = args.split()
+    return list(args)
 
 
-def _datum_for_eigmat(val, i, j, src_filename):
-    """One element of the eigenmatrix (idx_1=row, idx_2=col)."""
-    return Datum(
-        val=float(val),
-        typ="eig",
-        src_1=src_filename,
-        idx_1=int(i),
-        idx_2=int(j),
-    )
+def _full_path(opts, filename):
+    if os.path.isabs(filename):
+        return filename
+    return os.path.join(opts.directory, filename)
 
 
-def _datum_for_h(val, i, j, src_filename, atm_1=None, atm_2=None, wht=None,
-                 hlr=None):
-    # One mass-weighted Hessian matrix element. typ='h' so the scoring
-    # machinery picks 'h'-style weights. atm_1/atm_2 carry the atom indices
-    # so a distance-based weight (q2mm-master's int_wht) can be evaluated
-    # by the caller and stamped via the wht argument. hlr flags the
-    # "long-range" class so FXATM zeroes those (and only those) for fixed
-    # atoms at score time (bonded terms are kept); see score.compare_data.
-    return Datum(
-        val=float(val),
-        typ="h",
-        src_1=src_filename,
-        idx_1=int(i),
-        idx_2=int(j),
-        atm_1=atm_1,
-        atm_2=atm_2,
-        wht=wht,
-        hlr=hlr,
-    )
+def _flag_files(opts, flag):
+    """Filenames given to one flag; argparse's append/nargs gives a list of lists."""
+    for filenames in getattr(opts, flag, []) or []:
+        for filename in filenames:
+            yield filename
 
 
-def _load_geo_npy(calc_dir):
-    # Read calc/geo.npy (produced by AmberLeap.geo_extract via cpptraj) and
-    # split its rows into 1-2 (bonds), 1-3 (angle endpoints), and 1-4
-    # (dihedral endpoints) atom-pair lists. Returns ([], [], []) if the
-    # file is missing so the caller can fall back to default weights.
-    int2, int3, int4 = [], [], []
-    geo_path = os.path.join(calc_dir, "geo.npy")
-    if not os.path.isfile(geo_path):
-        return int2, int3, int4
+def _split_pair(token):
+    """'somename.in,somename.log' -> (leap input, gaussian log)."""
+    parts = token.split(",")
+    if len(parts) != 2:
+        raise ValueError("-ageig takes 'somename.in,somename.log', got '{}'".format(token))
+    return parts[0], parts[1]
+
+
+def _sibling(path, extension):
+    return os.path.splitext(path)[0] + extension
+
+
+# Reference and calculated Hessians (and normal modes) are compared element
+# by element, which only means something if the Gaussian job and the mol2 the
+# Amber topology is built from share one Cartesian frame and one atom order.
+# A rotated or reordered mol2 gives a finite, wrong fit with no other symptom.
+FRAME_TOLERANCE = 0.01   # Angstrom, after removing the centroid
+# max |V V^T - I| above which the printed normal modes are too coarse to use
+MODE_ORTHONORMALITY_TOLERANCE = 0.01
+
+
+def _warn_if_frames_differ(log_atoms, mol2_path, label):
+    """Warn when the geometry in a Gaussian log and the mol2 do not coincide."""
+    if not log_atoms or not mol2_path or not os.path.isfile(mol2_path):
+        return
     try:
-        hes_geo = np.load(geo_path, allow_pickle=True)
+        mol2_atoms = utilities.Mol2(mol2_path).structures[0].atoms
+        a = np.array([[x.x, x.y, x.z] for x in log_atoms], dtype=float)
+        b = np.array([[x.x, x.y, x.z] for x in mol2_atoms], dtype=float)
     except Exception as e:
-        logger.warning("Failed to load {}: {}".format(geo_path, e))
-        return int2, int3, int4
-    for ele in hes_geo:
-        # Each row is [a, b, c, d] with None in unused slots; non-None count
-        # picks the interaction class.
-        non_none = sum(1 for x in ele if x is not None)
-        a, b, c, d = ele
-        if non_none == 2:
-            int2.append([int(a), int(b)])
-        elif non_none == 3:
-            int3.append([int(a), int(c)])  # endpoints only
-        elif non_none == 4:
-            int4.append([int(a), int(d)])  # endpoints only
-    return int2, int3, int4
-
-
-def _int_wht(at_1, at_2, int2, int3, int4):
-    # Distance-based Hessian-element weights, per the Q2MM paper:
-    #   1-1 (same atom, 3x3 diagonal block):     0.0  (no contribution)
-    #   1-2 bonded (1 bond apart):               WEIGHTS['h12'] = 0.031
-    #   1-3 (angle endpoints, 2 bonds apart):    WEIGHTS['h13'] = 0.031
-    #   1-4 (dihedral endpoints, 3 bonds apart): WEIGHTS['h14'] = 0.31
-    #   all other (>3 bonds apart):              WEIGHTS['h']   = 0.031
-    # The 1-4 terms are emphasized (0.31) to represent the TS as a minimum.
-    # Pairs are stored unordered, so check both orders.
-    # Returns (weight, is_long_range). is_long_range is True only for the
-    # ">3 bonds apart" class -- the one q2mm-master zeroes for fixed atoms;
-    # diagonal and 1-2/1-3/1-4 (bonded) return False so FXATM keeps them.
-    if at_1 == at_2:
-        return 0.0, False
-    pair_a = [at_1, at_2]
-    pair_b = [at_2, at_1]
-    if pair_a in int2 or pair_b in int2:
-        return co.WEIGHTS["h12"], False
-    if pair_a in int3 or pair_b in int3:
-        return co.WEIGHTS["h13"], False
-    if pair_a in int4 or pair_b in int4:
-        return co.WEIGHTS["h14"], False
-    return co.WEIGHTS["h"], True
-
-
-def _datum_for_energy(val, idx_1, src_filename, typ="e"):
-    return Datum(
-        val=float(val),
-        typ=typ,
-        src_1=src_filename,
-        idx_1=int(idx_1),
-        idx_2=1,
-    )
-
-
-def _datum_for_bond(val, atoms, src_filename, typ="b", idx=None):
-    return Datum(val=float(val), typ=typ, src_1=src_filename, idx_1=idx,
-                 atm_1=atoms[0], atm_2=atoms[1])
-
-
-def _datum_for_angle(val, atoms, src_filename, typ="a", idx=None):
-    return Datum(val=float(val), typ=typ, src_1=src_filename, idx_1=idx,
-                 atm_1=atoms[0], atm_2=atoms[1], atm_3=atoms[2])
-
-
-def _datum_for_torsion(val, atoms, src_filename, typ="t", idx=None):
-    # idx (structure number) is folded into the label so the torsion label
-    # matches constants.RE_T_LBL ("t_<name>_<idx>_<a-b-c-d>"); without it,
-    # score.trim_data's RE_T_LBL.split(...)[1] raises IndexError.
-    return Datum(val=float(val), typ=typ, src_1=src_filename, idx_1=idx,
-                 atm_1=atoms[0], atm_2=atoms[1], atm_3=atoms[2], atm_4=atoms[3])
+        logger.debug("Frame check skipped for {}: {}".format(label, e))
+        return
+    if a.shape != b.shape:
+        logger.warning("{}: {} atoms in the Gaussian log but {} in {}; the data "
+                       "cannot be compared element by element.".format(
+                           label, len(a), len(b), mol2_path))
+        return
+    deviation = float(np.abs((a - a.mean(axis=0)) - (b - b.mean(axis=0))).max())
+    if deviation > FRAME_TOLERANCE:
+        logger.warning("{}: the geometry in the Gaussian log and {} differ by up to "
+                       "{:.3f} A after centering, so the Hessian / normal-mode frames "
+                       "do not match (run Gaussian with nosymm and build the mol2 "
+                       "from the same coordinates).".format(label, mol2_path, deviation))
 
 
 # ---------------------------------------------------------------------------
-# Per-file collectors
+# Gaussian reference files
 # ---------------------------------------------------------------------------
 
 def _gauss_log_hessian(path, invert=None):
@@ -268,7 +226,6 @@ def _gauss_log_hessian(path, invert=None):
     reaction coordinate) is replaced by that value, flipping the
     imaginary frequency to a real one before the matrix is reassembled.
     """
-    # Open the Gaussian .log via the utilities wrapper.
     log = utilities.GaussLog(path)
     # The archive block at the end of the .log carries the raw lower-tri
     # Hessian; read_archive() parses it into log.structures[0].hess.
@@ -277,7 +234,6 @@ def _gauss_log_hessian(path, invert=None):
     except Exception as e:
         logger.warning("Gaussian archive parse failed for {}: {}".format(path, e))
         return []
-    # Bail out cleanly if the .log had no archive Hessian (e.g., not a freq job).
     if not log.structures or log.structures[0].hess is None:
         logger.warning("No Hessian in Gaussian archive: {}".format(path))
         return []
@@ -288,29 +244,62 @@ def _gauss_log_hessian(path, invert=None):
     # by 1/sqrt(m_i) to convert to mass-weighted units that match Amber's
     # nab/nmode output.
     utilities.mass_weight_hessian(H, struct.atoms)
-    # Optional TS imaginary-mode flip: diagonalize, replace the MOST-NEGATIVE
-    # eigenvalue (the TS reaction coordinate / imaginary mode) with `invert`,
-    # and reassemble H from the modified spectrum. Use argmin(w), NOT
-    # argmin(|w|): the raw Hessian still carries ~0 translation/rotation modes,
-    # so smallest-magnitude would grab a rigid-body mode and leave the real
-    # negative reaction-coordinate mode untouched.
     if invert is not None:
-        w, v = np.linalg.eigh(H)
-        i = int(np.argmin(w))
-        if w[i] >= 0.0:
-            logger.warning(
-                "invert requested but no negative eigenvalue in {} "
-                "(min eig {:.4g}); not a transition state?".format(path, w[i]))
-        w[i] = float(invert)
-        H = v.dot(np.diag(w)).dot(v.T)
-    # Take only the lower-triangular indices: the Hessian is symmetric so
-    # the upper triangle is redundant data for the Q2MM fit.
-    tri_i, tri_j = np.tril_indices_from(H)
-    src = os.path.basename(path)
+        H = math_util.invert_lowest_eigenvalue(H, invert, label=path)
+    _warn_if_frames_differ(struct.atoms, _sibling(path, ".mol2"), "-gh " + os.path.basename(path))
     # One Datum per lower-tri element, tagged typ='h' so it picks up the
-    # uniform Hessian weight (WEIGHTS['h']=0.031) from q2mm-master.
-    return [_datum_for_h(H[i, j], i + 1, j + 1, src)
-            for i, j in zip(tri_i, tri_j)]
+    # uniform Hessian weight (WEIGHTS['h']) at score time.
+    return datums_from_hessian(H, os.path.basename(path))
+
+
+def _gauss_log_eigenmatrix(path, invert=None):
+    """
+    The reference eigenmatrix: the eigenvalues of the mass-weighted QM
+    Hessian, read from the frequency section of the Gaussian log (force
+    constant over reduced mass, per mode) in kJ/mol/A^2/amu, on the diagonal
+    of an otherwise zero matrix, emitted as Datum (typ='eig'). Mode 1 is the
+    lowest, the transition-state mode; with `invert` its (negative)
+    eigenvalue is replaced by that value. Matches upstream q2mm's -geigz.
+    """
+    log = utilities.GaussLog(path)
+    evals = np.asarray(log.evals, dtype=float)
+    if evals.size == 0:
+        logger.warning("No normal modes in the Gaussian log: {}".format(path))
+        return []
+    evals = evals * co.HESSIAN_CONVERSION
+    if invert is not None:
+        evals = math_util.replace_lowest_eigenvalue(evals, invert, label=path)
+    return datums_from_eigenmatrix(np.diag(evals), os.path.basename(path))
+
+
+def reference_modes(log_path, mol2_path=None):
+    """
+    The normalized, mass-weighted QM eigenvectors from the frequency section
+    of a Gaussian log (n_modes x 3N), for projecting the calculated Hessian
+    (-ageig). Warns when the log's geometry and the mol2 are not in the same
+    frame. Use freq=hpmodes: the low-precision normal coordinates are only
+    orthonormal to a few percent.
+    """
+    log = utilities.GaussLog(log_path)
+    evecs = np.asarray(log.evecs, dtype=float)
+    if evecs.size == 0:
+        raise ValueError("No normal modes in the Gaussian log: {}".format(log_path))
+    label = "-ageig " + os.path.basename(log_path)
+    # Low-precision normal coordinates (no freq=hpmodes: two decimals) give
+    # eigenvectors that are only roughly orthonormal, and that error goes
+    # straight into every element of the projected Hessian.
+    error = float(np.abs(evecs.dot(evecs.T) - np.eye(len(evecs))).max())
+    if error > MODE_ORTHONORMALITY_TOLERANCE:
+        logger.warning("{}: the normal modes are orthonormal only to {:.1%}; rerun the "
+                       "frequency job with freq=hpmodes so the eigenvectors are printed "
+                       "at full precision.".format(label, error))
+    try:
+        log_atoms = log.last_orientation()
+    except Exception as e:   # the check must never take a run down
+        logger.debug("Frame check skipped for {}: {}".format(label, e))
+        log_atoms = []
+    _warn_if_frames_differ(log_atoms, mol2_path, label)
+    return evecs
 
 
 def _gauss_log_energy(path, typ="e", group_idx=1):
@@ -330,242 +319,147 @@ def _gauss_log_energy(path, typ="e", group_idx=1):
     if energy is None:
         logger.warning("Could not extract Gaussian energy from {}".format(path))
         return []
-    return [_datum_for_energy(energy * co.HARTREE_TO_KJMOL,
-                              group_idx, os.path.basename(path), typ=typ)]
+    return [datum_from_energy(energy * co.HARTREE_TO_KJMOL, group_idx,
+                              os.path.basename(path), typ=typ)]
 
-
-def _amber_run(in_path, commands):
-    """
-    Run an AmberLeap calculation for the requested commands. Returns the
-    AmberLeap instance after run() has completed so caller can read
-    the produced .ene / .geo / .hes files.
-    """
-    leap = utilities.AmberLeap(in_path)
-    leap.commands = commands
-    if not getattr(_amber_run, "_skip_run", False):
-        try:
-            leap.run(check_tokens=False)
-        except Exception as e:
-            logger.warning("AmberLeap.run() failed for {}: {}".format(in_path, e))
-    return leap
-
-
-def _amber_hessian(in_path, invert=None):
-    """
-    Read the 3N x 3N mass-weighted Hessian produced by Amber's nab/nmode,
-    and emit its lower-triangular elements as Datum (typ='h') with
-    per-element distance-based weights, matching q2mm-master's '-ah'
-    convention (calculate.py int_wht). Mirrors _gauss_log_hessian on the
-    Gaussian side for dimension alignment.
-
-    If `invert` is given, the most-negative eigenvalue (the TS reaction
-    coordinate) is replaced with `invert` before the matrix is reassembled.
-    """
-    # Run tleap + sander min + nab to (re)generate the .hes and geo files.
-    leap = _amber_run(in_path, ["ah"])
-    hes_path = os.path.join(leap.directory, "calc", leap.name_hes)
-    # If the Amber pipeline failed, we'd have no .hes; bail out quietly.
-    if not os.path.isfile(hes_path):
-        logger.warning("Hessian file missing: {}".format(hes_path))
-        return []
-    # AmberHess.hessian parses the file, converts kcal/mol -> kJ/mol, and
-    # returns a 3N x 3N matrix that is already mass-weighted by nab/nmode.
-    hess = utilities.AmberHess(hes_path)
-    H = hess.hessian
-    if H is None:
-        return []
-    # Optional TS imaginary-mode flip: diagonalize, swap the smallest |eig|
-    # for `invert`, and reassemble H so the lower-tri output reflects it.
-    # Use argmin(w) (most-negative = TS reaction coordinate), NOT argmin(|w|),
-    # which would grab a ~0 translation/rotation mode instead.
-    if invert is not None:
-        w, v = np.linalg.eigh(H)
-        i = int(np.argmin(w))
-        if w[i] >= 0.0:
-            logger.warning(
-                "invert requested but no negative eigenvalue in {} "
-                "(min eig {:.4g}); not a transition state?".format(in_path, w[i]))
-        w[i] = float(invert)
-        H = v.dot(np.diag(w)).dot(v.T)
-    # Load the bond/angle/dihedral pair lists generated by cpptraj so the
-    # per-element weight can be assigned by atom-pair topology distance.
-    calc_dir = os.path.join(leap.directory, "calc")
-    int2, int3, int4 = _load_geo_npy(calc_dir)
-    if not (int2 or int3 or int4):
-        logger.warning("No geo.npy in {}; long-range weight 1.0 will apply "
-                       "to every non-diagonal pair.".format(calc_dir))
-    # Lower-triangular indices only -- the Hessian is symmetric so
-    # the upper triangle would just duplicate data points.
-    tri_i, tri_j = np.tril_indices_from(H)
-    # Use the .hes filename so the Datum label collapses to "amber" (the
-    # piece before the first dot), matching q2mm-master's label format.
-    src = leap.name_hes
-    data = []
-    for i, j in zip(tri_i, tri_j):
-        # idx coords are 1-based cartesian DoF; atoms are idx // 3 + 1 in
-        # 1-based numbering. // is integer division on 0-based equivalents.
-        atm_1 = int(i // 3 + 1)
-        atm_2 = int(j // 3 + 1)
-        wht, hlr = _int_wht(atm_1, atm_2, int2, int3, int4)
-        data.append(_datum_for_h(H[i, j], i + 1, j + 1, src,
-                                 atm_1=atm_1, atm_2=atm_2, wht=wht, hlr=hlr))
-    return data
-
-
-def _amber_energy(in_path, typ="e", group_idx=1):
-    leap = _amber_run(in_path, [typ])
-    ene_path = os.path.join(leap.directory, "calc", leap.name_ene)
-    if not os.path.isfile(ene_path):
-        logger.warning("Energy file missing: {}".format(ene_path))
-        return []
-    ene = utilities.AmberEne(ene_path)
-    data = []
-    for i, s in enumerate(ene.structures):
-        if "energy" in s.props:
-            data.append(_datum_for_energy(s.props["energy"], i + 1,
-                                          os.path.basename(in_path), typ=typ))
-    return data
-
-
-def _amber_geo(in_path, kind):
-    """
-    kind: 'b' bonds, 'a' angles, 't' torsions.
-    """
-    # NB: get_com_opts() recognizes the amber-prefixed tokens "abo"/"aao"/"ato"
-    # (leading 'a'); passing bare "bo"/"ao"/"to" left sp/opt/geo False, so tleap
-    # was skipped and the build crashed opening the never-written .ene file.
-    leap = _amber_run(in_path, ["a" + kind + "o"])
-    geo_path = os.path.join(leap.directory, "calc", leap.name_geo)
-    if not os.path.isfile(geo_path):
-        logger.warning("Geo file missing: {}".format(geo_path))
-        return []
-    geo = utilities.AmberGeo(geo_path)
-    return _geo_data_from(geo, kind, os.path.basename(in_path))
-
-
-def _gauss_run(in_path, commands):
-    """
-    Run an AmberLeap_Gaus calculation. This builds the Amber topology from the
-    matching leap input (<name>.in -> mol2 coordinates), takes a single-point
-    (no minimisation), and measures bonds/angles/torsions with the SAME cpptraj
-    enumeration + AmberGeo sort as _amber_geo -- so the reference internal
-    coordinates line up one-for-one with the '-abo/-aao/-ato' side. Returns the
-    AmberLeap_Gaus instance after run() so the caller can read the .geo file.
-
-    NB: the reference geometry comes from <name>.mol2 (via <name>.in), NOT from
-    the Gaussian .log passed on the command line -- the .log path is only used
-    to derive <name>. Put the QM reference geometry in the mol2 accordingly.
-    """
-    leap = utilities.AmberLeap_Gaus(in_path)
-    leap.commands = commands
-    if not getattr(_amber_run, "_skip_run", False):
-        try:
-            leap.run(check_tokens=False)
-        except Exception as e:
-            logger.warning(
-                "AmberLeap_Gaus.run() failed for {}: {}".format(in_path, e))
-    return leap
-
-
-def _gauss_geo(in_path, kind):
-    """
-    Reference geometry collector (bonds 'b', angles 'a', torsions 't') built by
-    AmberLeap_Gaus. Emits Datum objects in the same order as _amber_geo so
-    score.compare_data can pair reference and calculated points positionally.
-    """
-    leap = _gauss_run(in_path, ["a" + kind + "o"])
-    geo_path = os.path.join(leap.directory, "calc", leap.name_geo)
-    if not os.path.isfile(geo_path):
-        logger.warning("Geo file missing: {}".format(geo_path))
-        return []
-    geo = utilities.AmberGeo(geo_path)
-    return _geo_data_from(geo, kind, os.path.basename(in_path))
-
-
-def _geo_data_from(geo, kind, src):
-    """
-    Turn an AmberGeo object's structures into Datum objects. Shared by the
-    Amber ('-abo/-aao/-ato') and Gaussian ('-gabo/-gaao/-gato') geometry
-    collectors so both sides label and order their data identically. The
-    1-based structure index is stamped into each Datum (idx_1) so torsion
-    labels satisfy constants.RE_T_LBL.
-    """
-    data = []
-    for i, s in enumerate(geo.structures, 1):
-        if kind == "b":
-            for bond in s.bonds:
-                data.append(_datum_for_bond(bond.value, bond.atom_nums,
-                                            src, typ="b", idx=i))
-        elif kind == "a":
-            for ang in s.angles:
-                data.append(_datum_for_angle(ang.value, ang.atom_nums,
-                                             src, typ="a", idx=i))
-        elif kind == "t":
-            for tor in s.torsions:
-                data.append(_datum_for_torsion(tor.value, tor.atom_nums,
-                                               src, typ="t", idx=i))
-    return data
-
-
-# ---------------------------------------------------------------------------
-# Main dispatch
-# ---------------------------------------------------------------------------
 
 # (command flag, datum type, collector function)
-_COMMAND_DISPATCH = [
-    ("ah",   "h",   lambda p, opts: _amber_hessian(p, invert=opts.invert)),
-    ("ae",   "e",   lambda p, opts: _amber_energy(p, typ="e")),
-    ("ae1",  "e1",  lambda p, opts: _amber_energy(p, typ="e1")),
-    ("aeo",  "eo",  lambda p, opts: _amber_energy(p, typ="eo")),
-    ("ae1o", "e1o", lambda p, opts: _amber_energy(p, typ="e1o")),
-    ("abo",  "b",   lambda p, opts: _amber_geo(p, "b")),
-    ("aao",  "a",   lambda p, opts: _amber_geo(p, "a")),
-    ("ato",  "t",   lambda p, opts: _amber_geo(p, "t")),
-    ("gabo", "b",   lambda p, opts: _gauss_geo(p, "b")),
-    ("gaao", "a",   lambda p, opts: _gauss_geo(p, "a")),
-    ("gato", "t",   lambda p, opts: _gauss_geo(p, "t")),
-    ("gh",   "h",   lambda p, opts: _gauss_log_hessian(p, invert=opts.invert)),
+_GAUSSIAN_DISPATCH = [
+    ("gh",    "h",   lambda p, opts: _gauss_log_hessian(p, invert=opts.invert)),
+    ("geigz", "eig", lambda p, opts: _gauss_log_eigenmatrix(p, invert=opts.invert)),
     ("ge",   "e",   lambda p, opts: _gauss_log_energy(p, typ="e")),
     ("ge1",  "e1",  lambda p, opts: _gauss_log_energy(p, typ="e1")),
     ("geo",  "eo",  lambda p, opts: _gauss_log_energy(p, typ="eo")),
     ("ge1o", "e1o", lambda p, opts: _gauss_log_energy(p, typ="e1o")),
 ]
 
+# Every flag that produces data, with its datum type (for --fake).
+_FLAG_TYPES = OrderedDict(
+    [(flag, spec[0]) for flag, spec in calculators.AMBER_COMMANDS.items()]
+    + [(flag, calculators.AMBER_COMMANDS[cmd][0])
+       for flag, cmd in calculators.REFERENCE_GEOMETRY_COMMANDS.items()]
+    + [(flag, typ) for flag, typ, _ in _GAUSSIAN_DISPATCH]
+)
 
-def collect_data(opts):
+
+# ---------------------------------------------------------------------------
+# Amber calculators
+# ---------------------------------------------------------------------------
+
+def build_calculators(opts, ff=None, runner=None):
     """
-    Walk through each enabled command flag in opts and append Datum
-    objects produced by the matching collector function.
+    The AmberCalculators the Amber flags in `opts` ask for: one per leap
+    input (and per minimized/single-point kind), in order of first
+    appearance, holding every command given for that file. After them, one
+    reference-geometry calculator (prefix "gaus", single point) per Gaussian
+    log named by -gabo/-gaao/-gato; its leap input is <log stem>.in next to
+    the log, so the reference geometry comes from that mol2.
+    """
+    calculated = OrderedDict()   # (leap input path, minimize) -> [commands]
+    mode_logs = {}               # (leap input path, minimize) -> gaussian log for -ageig
+    for command, (_, minimize, _, _) in calculators.AMBER_COMMANDS.items():
+        for filename in _flag_files(opts, command):
+            log_name = None
+            if command == "ageig":
+                filename, log_name = _split_pair(filename)
+            key = (_full_path(opts, filename), minimize)
+            calculated.setdefault(key, []).append(command)
+            if log_name is not None:
+                log_path = _full_path(opts, log_name)
+                if mode_logs.get(key, log_path) != log_path:
+                    raise ValueError("-ageig: two different logs for {}".format(key[0]))
+                mode_logs[key] = log_path
+    reference = OrderedDict()    # gaussian log path -> [commands]
+    for flag, command in calculators.REFERENCE_GEOMETRY_COMMANDS.items():
+        for filename in _flag_files(opts, flag):
+            reference.setdefault(_full_path(opts, filename), []).append(command)
+
+    calcs = []
+    for key, commands in calculated.items():
+        in_path = key[0]
+        eigenvectors = None
+        if key in mode_logs:
+            eigenvectors = reference_modes(mode_logs[key], _mol2_of(in_path))
+        calcs.append(calculators.AmberCalculator(
+            os.path.dirname(in_path), os.path.basename(in_path), commands,
+            ff=ff, invert=opts.invert, runner=runner, eigenvectors=eigenvectors))
+    for log_path, commands in reference.items():
+        # NB: the reference geometry comes from <name>.mol2 (via <name>.in),
+        # NOT from the Gaussian .log -- the .log path only supplies <name>.
+        # Put the QM reference geometry in the mol2 accordingly.
+        stem = os.path.splitext(os.path.basename(log_path))[0]
+        calcs.append(calculators.AmberCalculator(
+            os.path.dirname(log_path), stem + ".in", commands,
+            prefix="gaus", runner=runner, src_name=os.path.basename(log_path)))
+    return calcs
+
+
+def _mol2_of(in_path):
+    """The mol2 a leap input loads (first .mol2 it names), else <stem>.mol2."""
+    if os.path.isfile(in_path):
+        for rel in utilities.AmberLeapInput(in_path).referenced_files():
+            if rel.endswith(".mol2"):
+                return os.path.join(os.path.dirname(in_path), rel)
+    return _sibling(in_path, ".mol2")
+
+
+def build_calculator(args, ff=None, runner=None):
+    """
+    The Calculator for the FF side of a fit, from CDAT-style arguments:
+    the AmberCalculator for the one leap input named, or a CalculatorGroup
+    when several are. `ff` is the force field being fitted; trial force
+    fields are written to ff.path.
+    """
+    opts = return_calculate_parser().parse_args(_split_args(args))
+    calcs = [c for c in build_calculators(opts, ff=ff, runner=runner)
+             if c.prefix == "amber"]
+    if not calcs:
+        raise ValueError("No Amber commands to build a calculator from: {}".format(args))
+    if len(calcs) == 1:
+        return calcs[0]
+    return calculators.CalculatorGroup(calcs)
+
+
+# ---------------------------------------------------------------------------
+# Main dispatch
+# ---------------------------------------------------------------------------
+
+def collect_data(opts, ff=None, runner=None):
+    """
+    Datum objects for every enabled flag in opts: the Amber calculators
+    first (calculated data, then Amber-measured reference geometry), then
+    the Gaussian log collectors.
     """
     data = []
-    for flag, _typ, collector in _COMMAND_DISPATCH:
-        groups = getattr(opts, flag, []) or []
-        # argparse with action='append' nargs='+' gives list-of-lists.
-        for filenames in groups:
-            for filename in filenames:
-                full = os.path.join(opts.directory, filename) \
-                    if not os.path.isabs(filename) else filename
-                if opts.fake:
-                    # produce one zeroed datum so optimizers don't crash
-                    data.append(Datum(val=0.0, typ=_typ,
-                                      src_1=os.path.basename(filename)))
-                    continue
-                logger.log(20, "  -- {} {}".format(flag, full))
-                data.extend(collector(full, opts))
+    if opts.fake:
+        # produce one zeroed datum per file so optimizers don't crash
+        for flag, typ in _FLAG_TYPES.items():
+            for filename in _flag_files(opts, flag):
+                data.append(Datum(val=0.0, typ=typ, src_1=os.path.basename(filename)))
+        return data
+    for calc in build_calculators(opts, ff=ff, runner=runner):
+        logger.log(20, "  -- {} {}".format(" ".join(calc.commands), calc.leap_input.path))
+        if opts.norun:
+            data.extend(calc.gather_results())
+        else:
+            data.extend(calc.evaluate(ff if calc.prefix == "amber" else None))
+    for flag, _typ, collector in _GAUSSIAN_DISPATCH:
+        for filename in _flag_files(opts, flag):
+            full = _full_path(opts, filename)
+            logger.log(20, "  -- {} {}".format(flag, full))
+            data.extend(collector(full, opts))
     return data
 
 
-def main(args):
+def main(args, ff=None):
     """
     Args may be a single string or list of strings. Returns a flat list
-    of Datum objects.
+    of Datum objects. With `ff`, the force field is written to disk before
+    the Amber calculations run; without it the frcmod on disk is used.
     """
-    if sys.version_info > (3, 0):
-        if isinstance(args, str):
-            args = args.split()
     parser = return_calculate_parser()
-    opts = parser.parse_args(args)
-    data = collect_data(opts)
+    opts = parser.parse_args(_split_args(args))
+    data = collect_data(opts, ff=ff)
     if opts.weight:
         score.import_weights(data)
     if opts.doprint:

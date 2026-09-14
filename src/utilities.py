@@ -6,6 +6,8 @@ from __future__ import print_function
 from __future__ import absolute_import
 from __future__ import division
 import copy
+import os
+import re
 import numpy as np
 import logging
 from logging import config
@@ -13,7 +15,8 @@ from typing import List
 #import parmed
 
 import constants as co
-from data_structs import *
+from data_structs import AmberFF, Angle, Atom, Bond, Datum, ParAMBER, Structure, Torsion
+from math_util import measure_bond
 
 config.dictConfig(co.LOG_SETTINGS)
 logger = logging.getLogger(__file__)
@@ -493,6 +496,44 @@ class GaussLog(File):
             # self.read_out()
             self.read_archive()
         return self._structures
+
+    ORIENTATION_TABLES = ("Input orientation:", "Standard orientation:")
+
+    def last_orientation(self) -> List[Atom]:
+        """Returns the atoms of the last coordinate table in the log, whether
+        an "Input orientation:" (what Gaussian prints with nosymm) or a
+        "Standard orientation:" table: the geometry the frequencies and
+        normal modes refer to. Each Atom carries index, atomic_num and x, y,
+        z in Angstrom. Empty when the log has no such table. Other tables
+        whose title ends in "orientation:" (Gaussian's "Dipole orientation:"
+        has no index column) are not coordinate tables and are skipped.
+
+        Returns:
+            List[Atom]: the atoms of the last orientation table
+        """
+        atoms: List[Atom] = []
+        lines = iter(self.lines)
+        for line in lines:
+            if not any(title in line for title in self.ORIENTATION_TABLES):
+                continue
+            block = []
+            for _ in range(4):
+                next(lines, None)
+            for row in lines:
+                if "---" in row:
+                    break
+                cols = row.split()
+                try:
+                    block.append(Atom(index=int(cols[0]), atomic_num=int(cols[1]),
+                                      x=float(cols[3]), y=float(cols[4]), z=float(cols[5])))
+                except (IndexError, ValueError):
+                    logger.warning("Unexpected row in an orientation table of {}: {!r}".format(
+                        self.filename, row.strip()))
+                    block = []
+                    break
+            if block:
+                atoms = block
+        return atoms
 
     @property
     def esp_rms(self):
@@ -1104,306 +1145,547 @@ class GaussLog(File):
 
 #region AMBER I/O
 
-class Frcmod(File):
+class AmberUtilities(object):
     """
-    STUFF TO FILL IN LATER TODO
+    Amber file I/O. Everything here reads or writes a file of the Amber
+    pipeline; nothing here runs a program -- that is calculators.AmberCalculator,
+    which calls these before a run (engine inputs) and after it (outputs). A
+    future TinkerUtilities would play the same role for Tinker.
+
+    Force field (frcmod)
+        parse_frcmod(lines)            -> (params, sub_names)
+        render_frcmod(params, lines)   -> lines with the parameter values written in
+        read_frcmod(path)              -> AmberFF
+        write_frcmod(ff, ...)          -> lines written
+    Engine inputs
+        sander_min_input(maxcyc, ncyc), sander_traj_input(), cpptraj_list_input(),
+        cpptraj_measure_input(...), nab_hessian_input(pdb, prmtop)
+    Engine outputs
+        parse_cpptraj_listing(lines)   -> (bonds, angles, torsions) atom-index lists
+        read_measurements(path)        -> last-frame values of a cpptraj `out` file
+        geo_summary(...)               -> the BONDS/ANGLES/TORSIONS/END text AmberGeo reads
+        read_hessian / read_energies / read_geometry(path) -> AmberHess/AmberEne/AmberGeo
     """
 
-    units = co.AMBERFF
+    SANDER_MIN = """Comments
+ &cntrl
+  imin      = 1,
+  ntx       = 1,
+  maxcyc    = {maxcyc},
+  ncyc      = {ncyc},
+  cut       = 15.0,
+  ntpr      = 10000,
+  ntwx      = 0,
+  ntb       = 0
+ /
+"""
 
-    def __init__(self, path=None, data=None, method=None, params=None, score=None):
-        super(Frcmod, self).__init__(path, data, method, params, score)
-        self.sub_names = []
-        self._atom_types = None
-        self._lines = None
-        self.force_field:AmberFF = None
-        # change constant
-        co.STEPS["bf"] = 10.00
-        co.STEPS["af"] = 10.0
-        co.STEPS["df"] = 10.0
+    SANDER_TRAJ = """Comments
+ &cntrl
+  imin      = 0,
+  ntx       = 1,
+  irest     = 0,
+  nstlim    = 0,
+  ntwx      = 1,
+  cut       = 15.0,
+  ntb       = 0,
+  ntpr      = 1
+ /
+"""
 
-    def copy_attributes(self, ff):
+    # Lists every bond, angle and dihedral of the topology.
+    CPPTRAJ_LIST = "bonds\nangles\ndihedrals *\n"
+
+    # nab program that computes the mass-weighted Hessian with nmode. Needs the
+    # nmode patch described in OPTIMIZATION.md section 0 to write hessian.mat.
+    # The dielectric constant (80.4, water) currently has to be changed by hand.
+    NAB_HESSIAN = """molecule m;
+float x[4000], fret;
+
+m = getpdb("{pdb}");
+readparm(m, "{prmtop}");
+
+mm_options( "cut=15., ntpr=1, nsnb=99999, diel = C, dielc = 80.40" );
+mme_init( m, NULL, "::Z", x, NULL);
+setxyz_from_mol( m, NULL, x );
+
+nmode( x, 3*m.natoms, mme2, 0, 0, 0.0, 0.0, 0);"""
+
+    # -- frcmod -------------------------------------------------------------
+
+    @staticmethod
+    def parse_frcmod(lines):
         """
-        Copies some general attributes to another force field.
+        Read the parameters of a frcmod from its lines.
 
-        Parameters
-        ----------
+        Only the region opened by a "# Q2MM" comment and switched on by a
+        later comment line containing "OPT" is read (see OPTIMIZATION.md
+        section 2). Returns (params, sub_names): the ParAMBER list, with
+        ff_row the 1-based line number and ff_col the column within the
+        line, and the comment headers seen inside the Q2MM region.
         """
-        ff.path = self.path
-        ff.sub_names = self.sub_names
-        ff._atom_types = self._atom_types
-        ff._lines = self._lines
-
-    @property
-    def lines(self):
-        if self._lines is None:
-            with open(self.path, "r") as f:
-                self._lines = f.readlines()
-        return self._lines
-
-    @lines.setter
-    def lines(self, x):
-        self._lines = x
-
-    def import_ff(self, path=None, sub_search="OPT"):
-        if path is None:
-            path = self.path
-        bonds = ["bond", "bond3", "bond4", "bond5"]
-        pibonds = ["pibond", "pibond3", "pibond4", "pibond5"]
-        angles = ["angle", "angle3", "angle4", "angle5"]
-        torsions = ["torsion", "torsion4", "torsion5"]
-        dipoles = ["dipole", "dipole3", "dipole4", "dipole5"]
-        self.params: List[ParAMBER] = []
+        params: List[ParAMBER] = []
+        sub_names = []
         q2mm_sec = False
         gather_data = False
-        self.sub_names = []
         count = 0
-        with open(path, "r") as f:
-            logger.log(logging.DEBUG, "READING: {}".format(path))
-            for i, line in enumerate(f):
-                split = line.split()
-                if not q2mm_sec and "# Q2MM" in line:
-                    q2mm_sec = True
-                elif q2mm_sec and "#" in line[0]:
-                    self.sub_names.append(line[1:])
-                    if "OPT" in line:
-                        gather_data = True
-                    else:
-                        gather_data = False
-                if gather_data and split:
-                    if "MASS" in line and count == 0:
-                        count = 1
-                        continue
-                    if "BOND" in line and count == 1:
-                        count = 2
-                        continue
-                    elif count == 1 and "ANGL" not in line:
-                        # atom symbol:atomic mass:atomic polarizability
-                        at = split[0]  # need number if it matters
-                        el = split[0]
-                        mass = split[1]
-                        if len(split) > 2:
-                            pol = split[2]
-                        # no need for atom label
-                        # at = ["Z0", "P1", "CX"]
-                    # BOND
-                    if "ANGL" in line and count == 2:
-                        count = 3
-                        continue
-                    elif count == 2 and "DIHE" not in line:
-                        # A1-A2 Force Const in kcal/mol/(A**2): Eq. length in A
-                        AA = line[:5].split("-")
-                        BB = line[5:].split()
-                        at = [AA[0], AA[1]]
-                        self.params.extend(
-                            (
-                                ParAMBER(
-                                    atom_types=at,
-                                    ptype="bf",
-                                    ff_col=1,
-                                    ff_row=i + 1,
-                                    value=float(BB[0]),
-                                ),
-                                ParAMBER(
-                                    atom_types=at,
-                                    ptype="be",
-                                    ff_col=2,
-                                    ff_row=i + 1,
-                                    value=float(BB[1]),
-                                ),
-                            )
-                        )
-                    # ANGLE
-                    if "DIHE" in line and count == 3:
-                        count = 4
-                        continue
-                    elif count == 3 and "IMPR" not in line:
-                        AA = line[: 2 + 3 * 2].split("-")
-                        BB = line[2 + 3 * 2 :].split()
-                        at = [AA[0], AA[1], AA[2]]
-                        self.params.extend(
-                            (
-                                ParAMBER(
-                                    atom_types=at,
-                                    ptype="af",
-                                    ff_col=1,
-                                    ff_row=i + 1,
-                                    value=float(BB[0]),
-                                ),
-                                ParAMBER(
-                                    atom_types=at,
-                                    ptype="ae",
-                                    ff_col=2,
-                                    ff_row=i + 1,
-                                    value=float(BB[1]),
-                                ),
-                            )
-                        )
-                    # Dihedral
-                    if "IMPR" in line and count == 4:
-                        count = 5
-                        continue
-                    elif count == 4 and "NONB" not in line:
-                        # (PK/IDIVF) * (1 + cos(PN*phi - PHASE))
-                        # A4 IDIVF PK PHASE PN
-                        nl = 2 + 3 * 3
-                        AA = line[:nl].split("-")
-                        BB = line[nl:].split()
-                        at = [AA[0], AA[1], AA[2], AA[3]]
-                        self.params.append(
+        for i, line in enumerate(lines):
+            split = line.split()
+            if not q2mm_sec and "# Q2MM" in line:
+                q2mm_sec = True
+            elif q2mm_sec and line.startswith("#"):
+                sub_names.append(line[1:])
+                if "OPT" in line:
+                    gather_data = True
+                else:
+                    gather_data = False
+            if gather_data and split:
+                if "MASS" in line and count == 0:
+                    count = 1
+                    continue
+                if "BOND" in line and count == 1:
+                    count = 2
+                    continue
+                elif count == 1 and "ANGL" not in line:
+                    # atom symbol:atomic mass:atomic polarizability -- nothing
+                    # here is a fitted parameter.
+                    pass
+                # BOND
+                if "ANGL" in line and count == 2:
+                    count = 3
+                    continue
+                elif count == 2 and "DIHE" not in line:
+                    # A1-A2 Force Const in kcal/mol/(A**2): Eq. length in A
+                    AA = line[:5].split("-")
+                    BB = line[5:].split()
+                    at = [AA[0], AA[1]]
+                    params.extend(
+                        (
                             ParAMBER(
                                 atom_types=at,
-                                ptype="df",
-                                ff_col=1,
-                                ff_row=i + 1,
-                                value=float(BB[1]),
-                            )
-                        )
-
-                    # Improper
-                    if "NONB" in line and count == 5:
-                        count = 6
-                        continue
-                    elif count == 5:
-                        nl = 2 + 3 * 3
-                        AA = line[:nl].split("-")
-                        BB = line[nl:].split()
-                        at = [AA[0], AA[1], AA[2], AA[3]]
-                        self.params.append(
-                            ParAMBER(
-                                atom_types=at,
-                                ptype="imp1",
+                                ptype="bf",
                                 ff_col=1,
                                 ff_row=i + 1,
                                 value=float(BB[0]),
-                            )
-                        )
-
-                    #                    # Hbond
-                    #                    if "NONB" in line and count == 6:
-                    #                        count == 7
-                    #                        continue
-                    #                    elif count == 6:
-                    #                        0
-
-                    # NONB
-                    if count == 6:
-                        continue
-
-                    if "vdw" == split[0]:
-                        # The first float is the vdw radius, the second has to do
-                        # with homoatomic well depths and the last is a reduction
-                        # factor for univalent atoms (I don't think we will need
-                        # any of these except for the first one).
-                        at = [split[1]]
-                        self.params.append(
+                            ),
                             ParAMBER(
                                 atom_types=at,
-                                ptype="vdw",
+                                ptype="be",
+                                ff_col=2,
+                                ff_row=i + 1,
+                                value=float(BB[1]),
+                            ),
+                        )
+                    )
+                # ANGLE
+                if "DIHE" in line and count == 3:
+                    count = 4
+                    continue
+                elif count == 3 and "IMPR" not in line:
+                    AA = line[: 2 + 3 * 2].split("-")
+                    BB = line[2 + 3 * 2 :].split()
+                    at = [AA[0], AA[1], AA[2]]
+                    params.extend(
+                        (
+                            ParAMBER(
+                                atom_types=at,
+                                ptype="af",
                                 ff_col=1,
                                 ff_row=i + 1,
-                                value=float(split[2]),
-                            )
+                                value=float(BB[0]),
+                            ),
+                            ParAMBER(
+                                atom_types=at,
+                                ptype="ae",
+                                ff_col=2,
+                                ff_row=i + 1,
+                                value=float(BB[1]),
+                            ),
                         )
-        logger.log(logging.DEBUG, "  -- Read {} parameters.".format(len(self.params)))
-        self.ff:AmberFF = AmberFF(self.path, data=None)
+                    )
+                # Dihedral
+                if "IMPR" in line and count == 4:
+                    count = 5
+                    continue
+                elif count == 4 and "NONB" not in line:
+                    # (PK/IDIVF) * (1 + cos(PN*phi - PHASE))
+                    # A4 IDIVF PK PHASE PN
+                    nl = 2 + 3 * 3
+                    AA = line[:nl].split("-")
+                    BB = line[nl:].split()
+                    at = [AA[0], AA[1], AA[2], AA[3]]
+                    params.append(
+                        ParAMBER(
+                            atom_types=at,
+                            ptype="df",
+                            ff_col=1,
+                            ff_row=i + 1,
+                            value=float(BB[1]),
+                        )
+                    )
+                # Improper
+                if "NONB" in line and count == 5:
+                    count = 6
+                    continue
+                elif count == 5:
+                    nl = 2 + 3 * 3
+                    AA = line[:nl].split("-")
+                    BB = line[nl:].split()
+                    at = [AA[0], AA[1], AA[2], AA[3]]
+                    params.append(
+                        ParAMBER(
+                            atom_types=at,
+                            ptype="imp1",
+                            ff_col=1,
+                            ff_row=i + 1,
+                            value=float(BB[0]),
+                        )
+                    )
+                # NONB
+                if count == 6:
+                    continue
+                if "vdw" == split[0]:
+                    # The first float is the vdw radius, the second has to do
+                    # with homoatomic well depths and the last is a reduction
+                    # factor for univalent atoms (I don't think we will need
+                    # any of these except for the first one).
+                    at = [split[1]]
+                    params.append(
+                        ParAMBER(
+                            atom_types=at,
+                            ptype="vdw",
+                            ff_col=1,
+                            ff_row=i + 1,
+                            value=float(split[2]),
+                        )
+                    )
+        logger.log(logging.DEBUG, "  -- Read {} parameters.".format(len(params)))
+        return params, sub_names
 
-    def export_ff(self, path=None, params:List[ParAMBER]=None, lines=None):
-        #TODO: MF change this such that it takes in an AmberFF and the AmberFF contains the params, the Frcmod makes/stores the lines
+    @staticmethod
+    def render_frcmod(params, lines):
         """
-        Exports the force field to a file, typically mm3.fld.
+        Return a copy of `lines` with the value of every parameter in
+        `params` written into its row (ff_row) and column (ff_col). Rows the
+        parameters do not touch are returned unchanged, so the template can
+        be any earlier rendering of the same file.
         """
-        if path is None:
-            path = self.path
-        if params is None:
-            params:List[ParAMBER] = self.params #TODO: MF - KK what? Unclear why this is obscuring earlier params, 
-            # will require close attention when refactoring but should fix whatever this is by refactoring
-        if lines is None:
-            lines = self.lines
+        lines = list(lines)
         for param in params:
             logger.log(logging.DEBUG, ">>> param: {} param.value: {}".format(param, param.value))
             line = lines[param.ff_row - 1]
             if abs(param.value) > 1999.0:
-                logger.warning("Value of {} is too high! Skipping write.".format(param)) #TODO: MF - KK wrote this, no clue why he needed it bc should be using allowed_range
-            else:
-                atoms = ""
-                const = ""
-                space3 = " " * 3
-                col = int(param.ff_col - 1)
-                value = "{:7.4f}".format(param.value)
-                tempsplit = line.split("-")
-                leng = len(tempsplit)
-                AA = None
-                BB = None
-                if leng == 2:
-                    # Bond
-                    nl = 2 + 3
-                    AA = line[:nl].split("-")
-                    BB = line[nl:].split()
-                    atoms = "-".join([format(el, "<2") for el in AA]) + space3 * 5
-                    BB[col] = value
-                    const = "".join([format(el, ">12") for el in BB])
-                elif leng == 3:
-                    # Angle
-                    nl = 2 + 3 * 2
-                    AA = line[:nl].split("-")
-                    BB = line[nl:].split()
-                    atoms = "-".join([format(el, "<2") for el in AA]) + space3 * 4
-                    BB[col] = value
-                    const = "".join([format(el, ">12") for el in BB])
-                elif leng >= 4:
-                    # Dihedral/Improper
-                    nl = 2 + 3 * 3
-                    AA = line[:nl].split("-")
-                    BB = line[nl:].split()
-                    atoms = "-".join([format(el, "<2") for el in AA]) + space3 * 2
-                    value = "{:7.5f}".format(param.value)
-                    if param.ptype == "imp1":
-                        atoms += space3
-                        BB[0] = value
-                        const = (
-                            "".join([format(el, ">12") for el in BB[:3]])
-                            + space3
-                            + " ".join(BB[3:])
-                        )
-                    else:
-                        atoms += format(BB[0], ">3")
-                        # Dihedral
-                        BB[1] = value
-                        const = (
-                            "".join([format(el, ">12") for el in BB[1:4]])
-                            + space3
-                            + " ".join(BB[4:])
-                        )
+                logger.warning("Value of {} is too high! Skipping write.".format(param))
+                continue
+            atoms = ""
+            const = ""
+            space3 = " " * 3
+            col = int(param.ff_col - 1)
+            value = "{:7.4f}".format(param.value)
+            tempsplit = line.split("-")
+            leng = len(tempsplit)
+            AA = None
+            BB = None
+            if leng == 2:
+                # Bond
+                nl = 2 + 3
+                AA = line[:nl].split("-")
+                BB = line[nl:].split()
+                atoms = "-".join([format(el, "<2") for el in AA]) + space3 * 5
+                BB[col] = value
+                const = "".join([format(el, ">12") for el in BB])
+            elif leng == 3:
+                # Angle
+                nl = 2 + 3 * 2
+                AA = line[:nl].split("-")
+                BB = line[nl:].split()
+                atoms = "-".join([format(el, "<2") for el in AA]) + space3 * 4
+                BB[col] = value
+                const = "".join([format(el, ">12") for el in BB])
+            elif leng >= 4:
+                # Dihedral/Improper
+                nl = 2 + 3 * 3
+                AA = line[:nl].split("-")
+                BB = line[nl:].split()
+                atoms = "-".join([format(el, "<2") for el in AA]) + space3 * 2
+                value = "{:7.5f}".format(param.value)
+                if param.ptype == "imp1":
+                    atoms += space3
+                    BB[0] = value
+                    const = (
+                        "".join([format(el, ">12") for el in BB[:3]])
+                        + space3
+                        + " ".join(BB[3:])
+                    )
+                else:
+                    atoms += format(BB[0], ">3")
+                    # Dihedral
+                    BB[1] = value
+                    const = (
+                        "".join([format(el, ">12") for el in BB[1:4]])
+                        + space3
+                        + " ".join(BB[4:])
+                    )
+            lines[param.ff_row - 1] = atoms + const + "\n"
+        return lines
 
-                lines[param.ff_row - 1] = atoms + const + "\n"
+    @staticmethod
+    def read_frcmod(path):
+        """
+        Read a frcmod into a new AmberFF: its fitted parameters
+        (parse_frcmod), the comment headers of the Q2MM region (sub_names)
+        and the file's lines, kept as the template write_frcmod renders onto.
+        """
+        logger.log(logging.DEBUG, "READING: {}".format(path))
+        with open(path, "r") as f:
+            lines = f.readlines()
+        ff = AmberFF(path, lines=lines)
+        ff.params, ff.sub_names = AmberUtilities.parse_frcmod(lines)
+        return ff
+
+    @staticmethod
+    def write_frcmod(ff, path=None, params=None, lines=None):
+        """
+        Write `ff` to `path` (default ff.path): its parameters (default
+        ff.params) rendered onto the template `lines` (default ff.lines; a
+        force field built from parameters alone has none, and is rendered
+        onto its file as it is on disk). Returns the lines written.
+        """
+        if path is None:
+            path = ff.path
+        if path is None:
+            raise ValueError("write_frcmod: the force field has no path to be written to.")
+        if params is None:
+            params = ff.params
+        if lines is None:
+            lines = ff.lines
+        if lines is None:
+            with open(ff.path or path, "r") as f:
+                lines = f.readlines()
+        new_lines = AmberUtilities.render_frcmod(params, lines)
         with open(path, "w") as f:
-            f.writelines(lines)
+            f.writelines(new_lines)
         logger.log(logging.DEBUG, "WROTE: {}".format(path))
+        return new_lines
 
-    def get_DOFs_by_atom_type(self, structs:List[Structure]) -> dict:
-        dof_by_param = dict()
-        for param in self.params:
-            dof_by_param[param.ff_row]:List[DOF] = []
-        for struct in structs:
-            for bond in struct.bonds:
-                dof_by_param[bond.ff_row].append(bond)
-            for angle in struct.angles:
-                dof_by_param[angle.ff_row].append(angle)
-            for dihed in struct.torsions:
-                dof_by_param[dihed.ff_row].append(dihed)
-        return dof_by_param
-    
-    def get_DOFs_by_param(self, structs:List[Structure]) -> dict:
-        return self.get_DOFs_by_atom_type(structs)
-    
+    # -- engine inputs -------------------------------------------------------
+
+    @classmethod
+    def sander_min_input(cls, maxcyc, ncyc):
+        """sander minimization input; maxcyc=0 gives a single point."""
+        return cls.SANDER_MIN.format(maxcyc=maxcyc, ncyc=ncyc)
+
+    @classmethod
+    def sander_traj_input(cls):
+        """0-step sander MD input that only writes the coordinates as a frame."""
+        return cls.SANDER_TRAJ
+
+    @classmethod
+    def cpptraj_list_input(cls):
+        return cls.CPPTRAJ_LIST
+
+    @staticmethod
+    def cpptraj_measure_input(trajectory, bonds, angles, torsions, out_prefix):
+        """
+        cpptraj script that measures every bond, angle and torsion of the
+        frame in `trajectory`, writing <out_prefix>.bonds / .angles / .torsions.
+        """
+        script = ["trajin {}".format(trajectory)]
+        for a, b in bonds:
+            script.append("distance @{} @{} out {}.bonds".format(a, b, out_prefix))
+        for a, b, c in angles:
+            script.append("angle @{} @{} @{} out {}.angles".format(a, b, c, out_prefix))
+        for a, b, c, d in torsions:
+            script.append("dihedral @{} @{} @{} @{} out {}.torsions".format(
+                a, b, c, d, out_prefix))
+        script.extend(["run", "write", "exit"])
+        return "\n".join(script) + "\n"
+
+    @classmethod
+    def nab_hessian_input(cls, pdb, prmtop):
+        return cls.NAB_HESSIAN.format(pdb=pdb, prmtop=prmtop)
+
+    # -- engine outputs ------------------------------------------------------
+
+    @staticmethod
+    def parse_cpptraj_listing(lines):
+        """
+        Atom indices of every bond, angle and dihedral in the listing that
+        cpptraj prints for the `bonds` / `angles` / `dihedrals *` commands.
+        Returns (bonds, angles, torsions) as lists of 1-based index lists.
+
+        cpptraj echoes each command in brackets ("[angles]"), prints a
+        header naming the atom columns ("... Atom1 Atom2 A1 A2 ...") and
+        ends with a "TIME:" line; the index columns sit at fixed offsets
+        from the end of each row because a dihedral row may carry an extra
+        leading flag column.
+        """
+        bonds = []
+        angles = []
+        torsions = []
+        count = 0
+        for line in lines:
+            # Bonds
+            if "[angles]" in line:
+                count = 0
+            elif count == 1:
+                bonds.append([int(x) for x in line.split()[-4:-2]])
+            elif "Atom2" in line:
+                count = 1
+
+            # Angles
+            if "[dihedrals" in line:   # matches "[dihedrals]" and "[dihedrals *]"
+                count = 0
+            if count == 2:
+                angles.append([int(x) for x in line.split()[-6:-3]])
+            elif "Atom3" in line:
+                count = 2
+
+            # Dihedral
+            # store the columns as negative since there is unexpected "B" or E in front of column
+            if "TIME" in line:
+                count = 0
+            if count == 3:
+                torsions.append([int(x) for x in line.split()[-8:-4]])
+            elif "Atom4" in line:
+                count = 3
+        return bonds, angles, torsions
+
+    @staticmethod
+    def read_measurements(path):
+        """
+        Values on the last frame of a cpptraj `out` file (the first column
+        is the frame number). Returns [] when the file does not exist.
+        """
+        if not os.path.isfile(path):
+            return []
+        with open(path, "r") as f:
+            lines = f.readlines()
+        if not lines:
+            return []
+        return [float(x) for x in lines[-1].split()[1:]]
+
+    @staticmethod
+    def geo_summary(bonds, angles, torsions, bond_values, angle_values,
+                    torsion_values):
+        """
+        The BONDS / ANGLES / TORSIONS / END text that AmberGeo reads: one
+        line per interaction, atom indices followed by the measured value.
+        A section is written only when it has values.
+        """
+        summary = ""
+        if bond_values:
+            summary += "BONDS\n"
+            for (a, b), value in zip(bonds, bond_values):
+                summary += "{} {} {} \n".format(a, b, value)
+        if angle_values:
+            summary += "ANGLES\n"
+            for (a, b, c), value in zip(angles, angle_values):
+                summary += "{} {} {} {} \n".format(a, b, c, value)
+        if torsion_values:
+            summary += "TORSIONS\n"
+            for (a, b, c, d), value in zip(torsions, torsion_values):
+                summary += "{} {} {} {} {} \n".format(a, b, c, d, value)
+        summary += "END"
+        return summary
+
+    @staticmethod
+    def read_hessian(path):
+        return AmberHess(path)
+
+    @staticmethod
+    def read_energies(path):
+        return AmberEne(path)
+
+    @staticmethod
+    def read_geometry(path):
+        return AmberGeo(path)
+
+
+class Frcmod(File):
+    """
+    An Amber frcmod on disk, paired with the AmberFF it holds. The file
+    object lives here in utilities; the force field inside it is a
+    data_structs object. AmberCalculator writes every trial force field
+    through one of these, rendering the trial parameters onto this file's
+    lines.
+    """
+
+    __slots__ = ["_force_field"]
+
+    def __init__(self, path, force_field=None, lines=None):
+        """
+        Args:
+            path (str): location of the frcmod.
+            force_field (AmberFF, optional): the force field the file holds.
+                Read from the file on first use when not given.
+            lines (List[str], optional): template lines to render onto.
+                Default: the force field's lines, else the file's.
+        """
+        super(Frcmod, self).__init__(path)
+        self._force_field = force_field
+        if lines is not None:
+            self._lines = list(lines)
+        elif force_field is not None and force_field._lines is not None:
+            self._lines = list(force_field._lines)
+
+    @property
+    def force_field(self) -> AmberFF:
+        if self._force_field is None:
+            self._force_field = AmberUtilities.read_frcmod(self.path)
+            self._lines = list(self._force_field.lines)
+        return self._force_field
+
+    @force_field.setter
+    def force_field(self, ff):
+        self._force_field = ff
+
+    def write_ff(self, ff=None, path=None):
+        """
+        Render the parameters of `ff` (default: the held force field) onto
+        this file's lines and write the result to `path` (default: this
+        file). The written lines become the new template.
+        """
+        if ff is None:
+            ff = self.force_field
+        self._lines = AmberUtilities.render_frcmod(ff.params, self.lines)
+        self.write(path or self.path, self._lines)
+        self._force_field = ff
+        logger.log(logging.DEBUG, "WROTE: {}".format(path or self.path))
+
+
 class AmberLeapInput(File):
-    def __init__(self, path: str, frcmod:Frcmod):
-        super(File, self).__init__(path)
-        self.frcmod = frcmod
+    """
+    The tleap script (MOL.in) that builds calc/prmtop and calc/inpcrd from
+    the mol2 and frcmod it names.
+    """
 
-    def write_in_file(self):
-        return
+    __slots__ = []
+
+    @property
+    def name(self):
+        return os.path.splitext(self.filename)[0]
+
+    def referenced_files(self):
+        """
+        Every file the script names that exists next to it (mol2, frcmod,
+        lib, ...), as paths relative to the script's directory. Anything
+        under calc/ is an output, not an input, and absolute paths work from
+        any directory, so both are left out. Used to clone a working
+        directory for parallel runs.
+        """
+        found = []
+        for line in self.lines:
+            for token in line.split():
+                if os.path.isabs(token):
+                    continue
+                rel = os.path.normpath(token)
+                if rel == "calc" or rel.startswith("calc" + os.sep):
+                    continue
+                if os.path.isfile(os.path.join(self.directory, rel)) and rel not in found:
+                    found.append(rel)
+        return found
+
 
 # Currently only for 1 system.
 # Note: It comes in mass-weighted kcal/mol (A?), then gets converted to kJ/mol but nothing else
@@ -1419,7 +1701,7 @@ class AmberHess(File):
             # Use self.path (the caller-supplied full path) rather than a
             # cwd-relative "./calc/" -- otherwise every AmberHess reads the
             # same file regardless of which particle/dir it belongs to,
-            # which silently breaks parallel SWARM and any non-cwd caller.
+            # which silently breaks parallel HYBR and any non-cwd caller.
             with open(self.path, 'r') as f:
                 lines = f.readlines()
             for i,line in enumerate(lines):
@@ -1434,7 +1716,7 @@ class AmberHess(File):
             # kcal/mol for energy in AMBER
             # E(kcal/mol -> cm**-1) = 349.75
             # freq = sqrt(lambda(kcal/mol)) / (2 pi c)
-            
+
             w, v = np.linalg.eigh(hessian)
             eigval = np.zeros([self.natoms * 3],dtype=float)
             for i,eig in enumerate(w):
@@ -1468,7 +1750,7 @@ class AmberEne(File):
                 sections = {'sp':1, 'minimization':2}
                 calc_section = 'sp'
                 count_previous = 0
-                    
+
                 for line in f:
                     count_current = sections[calc_section]
                     if count_current != count_previous:
@@ -1492,7 +1774,7 @@ class AmberEne(File):
     def read_line_for_energy(self, line):
         # The Amber Energy is in units of kcal/mol, so we have to convert them to kJ/mol
         # for consistency purposes.
-        # don't know how to use match = re.compile 
+        # don't know how to use match = re.compile
         linesplit = line.split()
         energy = float(linesplit[1])
         energy *= co.HARTREE_TO_KJMOL / co.HARTREE_TO_KCALMOL
@@ -1521,14 +1803,14 @@ class AmberGeo(File):
             # Use self.path (the caller-supplied full path) rather than a
             # cwd-relative "./calc/" -- otherwise every AmberGeo reads the same
             # file regardless of which particle dir it belongs to, silently
-            # breaking parallel SWARM (all particles score the base geometry so
+            # breaking parallel HYBR (all particles score the base geometry so
             # the global best never improves). Same fix as AmberHess.hessian.
             with open(self.path, 'r') as f:
                 sections = {'sp':1, 'minimization':2, 'hessian':2}
                 count_previous = 0
                 calc_section = 'sp'
                 b = 0
-                a = 0  
+                a = 0
                 t = 0
                 for line in f:
                     count_current = sections[calc_section]
@@ -1635,572 +1917,6 @@ class AmberGeo(File):
             return energy
         else:
             return None
-class AmberLeap_Gaus(File):
-    def __init__(self, path):
-        """
-            run -> gaus to amber -> sp -> traj -> cpptraj -> cpptraj -> AmberGeo
-            path = leap.in
-        """
-        super(AmberLeap_Gaus, self).__init__(path)
-        self._index_output_log = None
-        self._structures = None
-        self.commands = None
-        self.name = os.path.splitext(self.filename)[0]
-        self.filename = self.name + '.in' # .log file to .in (.in file is never replaced. so using .in should have original coordinate)
-        self.name_log = 'gaus.' + self.name + '.log'
-        self.name_prm = 'gaus.' + self.name + '.parm7' #topology
-        self.name_rst = 'gaus.' + self.name + '.rst7' # coordinate
-        self.name_min = 'gaus.' + self.name + '.min' # sander min input
-        self.name_ene = 'gaus.' + self.name + '.ene'
-        self.name_dyn = 'gaus.' + self.name + '.dyn' # sander dyn input
-        self.name_int = 'gaus.' + self.name + '.int' # interaction input for cpptraj
-        self.name_geo = 'gaus.' + self.name + '.geo' # cpptraj output for all interactions (to be read by AmberGeo)
-        self.min_script = """Comments
- &cntrl
-  imin      = 1,
-  ntx       = 1,
-  maxcyc    = 0,
-  ncyc      = 0,
-  cut       = 15.0,
-  ntpr      = 10000,
-  ntwx      = 0,
-  ntb       = 0
- /
-"""
-        self.dyn_script = """Comments
- &cntrl
-  imin      = 0,
-  ntx       = 1,
-  irest     = 0,
-  nstlim    = 0,
-  ntwx      = 1,
-  cut       = 15.0,
-  ntb       = 0,
-  ntpr      = 1
- /
-"""
-    @property
-    def structures(self):
-        if self._structures is None:
-            logger.log(logging.DEBUG, 'READING: {}'.format(self.filename))
-            struct = Structure(self.filename)
-            self._structures = [struct]
-            with open(self.filename, 'r') as f:
-                for line in f:
-                    line = line.split()
-                    if len(line) == 2:
-                        struct.props['total atoms'] = int(line[0])
-                        struct.props['title'] = line[1]
-                        logger.log(5, '  -- Read {} atoms.'.format(
-                            struct.props['total atoms']))
-                    if len(line) > 2:
-                        indx, ele, x, y, z, at, bonded_atom = line[0], \
-                            line[1], line[2], line[3], line[4], \
-                            line[5], line[6:]
-                        struct.atoms.append(Atom(index=int(indx),
-                            element=ele,
-                            x=float(x),
-                            y=float(y),
-                            z=float(z),
-                            atom_type=at,
-                            atom_type_name=at,
-                            bonded_atom_indices=bonded_atom))
-            return self._structures
-    def get_com_opts(self):
-        com_opts = {'freq': False,
-                    'opt': False,
-                    'sp':True,
-                    'tors': False,
-                    'geo':True}
-        return com_opts
-
-#BUG: 'fixatomorder' is removed in Himani's version of q2mm_kk, this is correct
-# 'fixatomorder' command is removed because it causes mismatches between the line
-# numbers of atoms, thus producing nonsensical bond lengths in the output .geo files.
-# This was pinpointed by Mikaela and Himani on 11/28/22 and running without this command
-# does not crash, produce errors, or result in nonsensical bonds.
-# [Removed 2026-08 from the extract() script below AND from AmberLeap.extract():
-#  with fixatomorder present, cpptraj measured a C-H bond as ~5.9 A instead of ~1.09 A.]
-
-    def extract(self,log):
-        script="""
-trajin calc/gaus.NAME.nc
-AA
-run
-write
-exit
-"""
-        script = script.replace("NAME",self.name)
-        geo = ""
-
-        # read .geo file and store all possible interaction
-        bonds = []
-        angles = []
-        torsions = []
-        ref = open('./calc/'+self.name_geo,'r').readlines()
-        count = 0
-        for line in ref:
-            # Bonds
-            if "[angles]" in line:
-                count = 0
-            elif count == 1:
-                bonds.append(line.split()[-4:-2])
-            elif "Atom2" in line:
-                count = 1
-
-            # Angles
-            if "[dihedrals" in line:   # matches "[dihedrals]" and "[dihedrals *]"
-                count = 0
-            if count == 2:
-                angles.append(line.split()[-6:-3])
-            elif "Atom3" in line:
-                count = 2
-
-            # Dihedral
-            # store the columns as negtive since there is unexpected "B" or E in front of column
-            if "TIME" in line:
-                count = 0
-            if count == 3:
-                torsions.append(line.split()[-8:-4])
-            elif "Atom4" in line:
-                count = 3
-        
-        for a,b in bonds:
-            geo += "distance @{} @{} out calc/gaus.bonds".format(a,b) + '\n'
-        for a,b,c in angles:
-            geo += "angle @{} @{} @{} out calc/gaus.angles".format(a,b,c) + '\n'
-        for a,b,c,d in torsions:
-            geo += "dihedral @{} @{} @{} @{} out calc/gaus.torsions".format(a,b,c,d) + '\n'
-        
-        script = script.replace("AA",geo)
-        script_f = './calc/' + self.name + '.temp'
-        with open(script_f, 'w') as f:
-            f.write(script)
-        sp.call("cpptraj -p calc/prmtop < {}".format(script_f), shell=True, stderr=log, stdin=log, stdout=log)
-        summary = ""
-        if os.path.isfile("calc/gaus.bonds"):
-            bond_file = open("calc/gaus.bonds","r").readlines()
-            bond_line = bond_file[-1].split()[1:]
-            summary += "BONDS\n"
-            i = 0
-            for a,b in bonds:
-                summary += "{} {} {} \n".format(a,b,bond_line[i])
-                i += 1
-        if os.path.isfile("calc/gaus.angles"):
-            angle_file = open("calc/gaus.angles","r").readlines()
-            angle_line = angle_file[-1].split()[1:]
-            summary += "ANGLES\n"
-            i = 0
-            for a,b,c in angles:
-                summary += "{} {} {} {} \n".format(a,b,c,angle_line[i])
-                i += 1
-        if os.path.isfile("calc/gaus.torsions"):
-            tors_file = open("calc/gaus.torsions","r").readlines()
-            tors_line = tors_file[-1].split()[1:]
-            summary += "TORSIONS\n"
-            i = 0
-            for a,b,c,d in torsions:
-                summary += "{} {} {} {} {} \n".format(a,b,c,d,tors_line[i])
-                i += 1
-        summary += "END"
-        # replace name_geo with summary
-        with open('./calc/'+self.name_geo,'w') as f:
-            f.write(summary)
-        return
-
-    def geometry(self,log):
-        # Run Trajectory (Required for cpptraj)
-        with open("./calc/"+self.name_dyn, 'w') as f:
-            f.write(self.dyn_script)
-        sp.call("sander -O -i calc/{} -o calc/traj.out -p calc/prmtop -c calc/gaus.{}.rst -x calc/gaus.{}.nc".format(self.name_dyn,self.name,self.name),shell=True)
-        # Generate All geometry
-        int_script = "bonds\nangles\ndihedrals *\n"
-        with open('./calc/'+self.name_int, 'w') as f:
-            f.write(int_script)
-        sp.call("cpptraj -p calc/prmtop < calc/{} > calc/{} \n".format(self.name_int,self.name_geo),shell=True)
-        self.extract(log)
-        return
-    def run(self,check_tokens=False):
-        logger.log(5, 'RUNNING: {}'.format(self.filename))
-        self._index_output_log = []
-        com_opts = self.get_com_opts()
-        current_directory = os.getcwd()
-        os.chdir(self.directory)
-        log = open(self.name_log,'w')
-        os.chdir(self.directory)
-        if os.path.isfile('calc'):
-            os.remove('calc')
-        sp.call("mkdir calc",shell=True, stderr=log, stdin=log, stdout=log)
-        if com_opts['sp']:
-            logger.log(logging.DEBUG, '  CALCULATE: {}'.format(self.filename))
-            # Run leap
-            sp.call("tleap -f {}".format(self.filename),shell=True, stderr=log, stdin=log, stdout=log) # parm7 rst7 files made
-            # Run Min
-            with open("./calc/"+self.name_min, 'w') as f:
-                f.write(self.min_script)
-            sp.call("sander -O -i calc/{} -o calc/{} -p calc/prmtop -c calc/inpcrd -r calc/gaus.{}.rst".format(self.name_min,self.name_ene,self.name),shell=True, stderr=log, stdin=log, stdout=log)
-        if com_opts['geo']:
-            self.geometry(log)
-        os.chdir(current_directory)
-
-class AmberLeap(File):
-    def __init__(self, path):
-        """
-            path = leap.in
-        """
-        super(AmberLeap, self).__init__(path)
-        self._index_output_log = None
-        self._structures = None
-        self.commands = None
-        self.name = os.path.splitext(self.filename)[0]
-        self.name_log = 'amber.' + self.name + '.log'
-        self.name_prm = 'amber.' + self.name + '.parm7' #topology
-        self.name_rst = 'amber.' + self.name + '.rst7' # coordinate
-        self.name_min = 'amber.' + self.name + '.min' # sander min input
-        self.name_ene = 'amber.' + self.name + '.ene'
-        self.name_dyn = 'amber.' + self.name + '.dyn' # sander dyn input
-        self.name_int = 'amber.' + self.name + '.int' # interaction input for cpptraj
-        self.name_geo = 'amber.' + self.name + '.geo' # cpptraj output for all interactions
-        self.name_hes = 'amber.' + self.name + '.hes'
-        self.geo = None
-        self.min_script = """Comments
- &cntrl
-  imin      = 1,
-  ntx       = 1,
-  maxcyc    = aa,
-  ncyc      = bb,
-  cut       = 15.0,
-  ntpr      = 10000,
-  ntwx      = 0,
-  ntb       = 0
- /
-"""
-        self.dyn_script = """Comments
- &cntrl
-  imin      = 0,
-  ntx       = 1,
-  irest     = 0,
-  nstlim    = 0,
-  ntwx      = 1,
-  cut       = 15.0,
-  ntb       = 0,
-  ntpr      = 1
- /
-"""
-    @property
-    def structures(self):
-        if self._structures is None:
-            logger.log(logging.DEBUG, 'READING: {}'.format(self.filename))
-            struct = Structure(self.filename)
-            self._structures = [struct]
-            with open(self.filename, 'r') as f:
-                for line in f:
-                    line = line.split()
-                    if len(line) == 2:
-                        struct.props['total atoms'] = int(line[0])
-                        struct.props['title'] = line[1]
-                        logger.log(5, '  -- Read {} atoms.'.format(
-                            struct.props['total atoms']))
-                    if len(line) > 2:
-                        indx, ele, x, y, z, at, bonded_atom = line[0], \
-                            line[1], line[2], line[3], line[4], \
-                            line[5], line[6:]
-                        struct.atoms.append(Atom(index=int(indx),
-                            element=ele,
-                            x=float(x),
-                            y=float(y),
-                            z=float(z),
-                            atom_type=at,
-                            atom_type_name=at,
-                            bonded_atom_indices=bonded_atom))
-            return self._structures
-    def get_com_opts(self):
-        com_opts = {'freq': False,
-                    'opt': False,
-                    'sp': False,
-                    'tors': False,
-                    'geo':False}
-        if any(x in ['ab','aa','at','abo','aao','ato'] for x in self.commands):
-            com_opts['geo'] = True
-        if any(x in ['abo','aao','ato','aeo','ae1o','aeao'] for x in self.commands):
-            com_opts['opt'] = True
-            com_opts['sp'] = True
-        if any(x in ['ah', 'ajeig', 'ageig'] for x in self.commands):
-            com_opts['geo'] = True
-            com_opts['freq'] = True
-            com_opts['opt'] = True
-            com_opts['sp'] = True
-        if any(x in ['at', 'ato'] for x in self.commands):
-            com_opts['tors'] = True
-        return com_opts
-    def extract(self,log):
-#BUG: 'fixatomorder' is removed in Himani's version of q2mm_kk, this is correct
-# 'fixatomorder' command is removed because it causes mismatches between the line
-# numbers of atoms, thus producing nonsensical bond lengths in the output .geo files.
-# This was pinpointed by Mikaela and Himani on 11/28/22 and running without this command
-# does not crash, produce errors, or result in nonsensical bonds.
-# [Removed 2026-08 from this extract() script AND from AmberLeap_Gaus.extract():
-#  with fixatomorder present, cpptraj measured a C-H bond as ~5.9 A instead of ~1.09 A.]
-
-        script="""
-trajin calc/amber.NAME.nc
-AA
-run
-write
-exit
-"""
-        script = script.replace("NAME",self.name)
-        geo = ""
-
-        # read .geo file and store all possible interaction
-        bonds = []
-        angles = []
-        torsions = []
-        ref = open('./calc/'+self.name_geo,'r').readlines()
-        self.geo = ref
-        count = 0
-        for line in ref:
-            # Bonds
-            if "[angles]" in line:
-                count = 0
-            elif count == 1:
-                bonds.append(line.split()[-4:-2])
-            elif "Atom2" in line:
-                count = 1
-
-            # Angles
-            if "[dihedrals" in line:   # matches "[dihedrals]" and "[dihedrals *]"
-                count = 0
-            if count == 2:
-                angles.append(line.split()[-6:-3])
-            elif "Atom3" in line:
-                count = 2
-
-            # Dihedral
-            # store the columns as negtive since there is unexpected "B" or E in front of column
-            if "TIME" in line:
-                count = 0
-            if count == 3:
-                torsions.append(line.split()[-8:-4])
-            elif "Atom4" in line:
-                count = 3
-
-        for a,b in bonds:
-            geo += "distance @{} @{} out calc/amber.bonds".format(a,b) + '\n'
-        for a,b,c in angles:
-            geo += "angle @{} @{} @{} out calc/amber.angles".format(a,b,c) + '\n'
-        for a,b,c,d in torsions:
-            geo += "dihedral @{} @{} @{} @{} out calc/amber.torsions".format(a,b,c,d) + '\n'
-        script = script.replace("AA",geo)
-        script_f = './calc/' + self.name + '.temp'
-        with open(script_f, 'w') as f:
-            f.write(script)
-        sp.call("cpptraj -p calc/prmtop < {}".format(script_f), shell=True, stderr=log, stdin=log, stdout=log)
-        summary = ""
-        if os.path.isfile("calc/amber.bonds"):
-            bond_file = open("calc/amber.bonds","r").readlines()
-            bond_line = bond_file[-1].split()[1:]
-            summary += "BONDS\n"
-            i = 0
-            for a,b in bonds:
-                summary += "{} {} {} \n".format(a,b,bond_line[i])
-                i += 1
-        if os.path.isfile("calc/amber.angles"):
-            angle_file = open("calc/amber.angles","r").readlines()
-            angle_line = angle_file[-1].split()[1:]
-            summary += "ANGLES\n"
-            i = 0
-            for a,b,c in angles:
-                summary += "{} {} {} {} \n".format(a,b,c,angle_line[i])
-                i += 1
-        if os.path.isfile("calc/amber.torsions"):
-            tors_file = open("calc/amber.torsions","r").readlines()
-            tors_line = tors_file[-1].split()[1:]
-            summary += "TORSIONS\n"
-            i = 0
-            for a,b,c,d in torsions:
-                summary += "{} {} {} {} {} \n".format(a,b,c,d,tors_line[i])
-                i += 1
-        summary += "END"
-        # replace name_geo with summary
-        with open('./calc/'+self.name_geo,'w') as f:
-            f.write(summary)
-        return
-
-    def hessian(self,log):
-        # if pdb file does not exit, then convert mol2 to pdb
-        os.chdir(self.directory)
-        if os.path.isfile(self.name+".pdb"):
-            0
-        else:
-            sp.call("antechamber -dr no -i {} -fi mol2 -o {} -fo pdb".format(self.name+".mol2",self.name+".pdb"),shell=True)
-        # nab input file
-        # dielectric constant = 80.4 for water.
-        # currently manual change required
-        script = """molecule m;
-float x[4000], fret;
-
-m = getpdb("{}.pdb");
-readparm(m, "./calc/prmtop");
-
-mm_options( "cut=15., ntpr=1, nsnb=99999, diel = C, dielc = 80.40" );
-mme_init( m, NULL, "::Z", x, NULL);
-setxyz_from_mol( m, NULL, x );
-
-nmode( x, 3*m.natoms, mme2, 0, 0, 0.0, 0.0, 0);""".format(self.name)
-        
-#         script = """#include <stdio.h>
-# #include <string.h>
-# #include <stdlib.h>
-# #include <math.h>
-# #include <assert.h>
-# #include "nabc.h"
-# static int mytaskid, numtasks;
-
-# static MOLECULE_T *m;
-
-# static REAL_T x[4000], fret;
-
-
-# int main( argc, argv )
-# 	int	argc;
-# 	char	*argv[];
-# {
-# 	nabout = stdout; /*default*/
-
-# 	mytaskid=0; numtasks=1;
-# m = getpdb( "{}.pdb", NULL );
-# readparm( m, "./calc/prmtop" );
-
-# mm_options( "cut=15., ntpr=1, nsnb=99999, diel = C, dielc = 80.40" );
-# mme_init( m, NULL, "::Z", x, NULL );
-# setxyz_from_mol(  &m, NULL, x );
-
-# nmode( x, 3 *  *( NAB_mri( m, "natoms" ) ), mme2, 0, 0, 0.000000E+00, 0.000000E+00, 0 );
-
-# 	exit( 0 );}""".format(self.name)
-
-        with open('./calc/'+self.name+'.nab','w') as f:
-            f.write(script)
-        # nab compile
-        sp.call("nab -v calc/{}.nab -o calc/{}".format(self.name, self.name),shell=True)
-        # with open('./calc/'+self.name+'.c','w') as f:
-        #     f.write(script)
-        # nab compile
-        #sp.call("gcc -v calc/{}.c -o calc/{} > gcc.out".format(self.name, self.name),shell=True)
-        # nab run
-        sp.call("./calc/{}".format(self.name),shell=True,stderr=log, stdin=log, stdout=log)
-        # hessian.mat formed
-        # rename to .hess
-        sp.call("mv ./calc/hessian.mat ./calc/{}".format(self.name_hes),shell = True)
-        return
-    def geo_extract(self):
-    
-        bonds = []
-        angles = []
-        torsions = []
-    
-        ref = self.geo
-        count = 0
-        for line in ref:
-            # Bonds
-            if "[angles]" in line:
-                count = 0
-            elif count == 1:
-                bonds.append(line.split()[-4:-2])
-            elif "Atom2" in line:
-                count = 1
-
-            # Angles
-            if "[dihedrals" in line:   # matches "[dihedrals]" and "[dihedrals *]"
-                count = 0
-            if count == 2:
-                angles.append(line.split()[-6:-3])
-            elif "Atom3" in line:
-                count = 2
-
-            # Dihedral
-            # store the columns as negtive since there is unexpected "B" or E in front of column
-            if "TIME" in line:
-                count = 0
-            if count == 3:
-                torsions.append(line.split()[-8:-4])
-            elif "Atom4" in line:
-                count = 3
-
-        hes_ele = np.array([None,None,None,None])
-        for a,b in bonds:
-            hes_ele = np.vstack((hes_ele,[a,b,None,None]))
-        for a,b,c in angles:
-            hes_ele = np.vstack((hes_ele,[a,b,c,None]))
-        for a,b,c,d in torsions:
-            hes_ele = np.vstack((hes_ele,[a,b,c,d]))
-        np.save("calc/geo",hes_ele)
-        return
-        
-    def geometry(self,log):
-        # Run Trajectory (Required for cpptraj)
-        with open("./calc/"+self.name_dyn, 'w') as f:
-            f.write(self.dyn_script)
-        sp.call("sander -O -i calc/{} -o calc/traj.out -p calc/prmtop -c calc/amber.{}.rst -x calc/amber.{}.nc".format(self.name_dyn,self.name,self.name),shell=True)
-        # Generate All geometry
-        int_script = "bonds\nangles\ndihedrals *\n"
-        with open('./calc/'+self.name_int, 'w') as f:
-            f.write(int_script)
-        sp.call("cpptraj -p calc/prmtop < calc/{} > calc/{}".format(self.name_int,self.name_geo),shell=True)
-        self.extract(log)
-        
-        return
-    def run(self,check_tokens=False):
-        logger.log(5, 'RUNNING: {}'.format(self.filename))
-        self._index_output_log = []
-        com_opts = self.get_com_opts()
-        current_directory = os.getcwd()
-        os.chdir(self.directory)
-        log = open(self.name_log,'w')
-        sp.call("mkdir calc",shell=True, stderr=log, stdin=log, stdout=log)
-        if com_opts['opt']:
-            logger.log(logging.DEBUG, '  MINIMIZE & ANALYZE: {}'.format(self.filename))
-            # Run leap
-            sp.call("tleap -f {}".format(self.filename),shell=True, stderr=log, stdin=log, stdout=log) # parm7 rst7 files made
-            # Run Min
-            self.min_script = self.min_script.replace("aa","700")
-            self.min_script = self.min_script.replace("bb","5")
-            with open("./calc/"+self.name_min, 'w') as f:
-                f.write(self.min_script)
-            sp.call("sander -O -i calc/{} -o calc/{} -p calc/prmtop -c calc/inpcrd -r calc/amber.{}.rst".format(self.name_min,self.name_ene,self.name),shell=True, stderr=log, stdin=log, stdout=log)
-        elif com_opts['sp']:
-            logger.log(logging.DEBUG, '  CALCULATE: {}'.format(self.filename))
-            # Run leap
-            sp.call("tleap -f {}".format(self.filename),shell=True, stderr=log, stdin=log, stdout=log) # parm7 rst7 files made
-            # Run Min
-            self.min_script = self.min_script.replace("aa","0")
-            self.min_script = self.min_script.replace("bb","0")
-            with open("./calc/"+self.name_min, 'w') as f:
-                f.write(self.min_script)
-            sp.call("sander -O -i calc/{} -o calc/{} -p calc/prmtop -c calc/inpcrd -r calc/amber.{}.rst".format(self.name_min,self.name_ene,self.name),shell=True, stderr=log, stdin=log, stdout=log)
-        # check if energy calculation failed
-        restart = 1
-        while(restart==1):
-            with open("./calc/"+self.name_ene,'r') as f:
-                fline = f.readlines()
-                for line in fline:
-                    if "restarting should resolve the error" in line:
-                        sp.call("sander -O -i calc/{} -o calc/{} -p calc/prmtop -c calc/amber.{}.rst -r calc/amber.{}.rst".format(self.name_min,self.name_ene,self.name,self.name),shell=True, stderr=log, stdin=log, stdout=log)
-                        restart = 1
-                    else:
-                        restart = 0
-
-        if com_opts['geo']:
-            self.geometry(log)
-        if com_opts['freq']:
-            self.hessian(log)
-            # if geo file is already present 
-            # may not have geo file if hessian is only ran
-            if os.path.isfile('./calc/'+self.name_geo):
-                self.geo_extract()
-        os.chdir(current_directory)
-
 
 #endregion AMBER I/O
 

@@ -5,7 +5,9 @@ simplex
 In-house simplex (Nelder-Mead-like) optimizer for q2mm-amber-main.
 
 Port of q2mm-master/q2mm/simplex.py. Imports the new data_structs and
-score modules. Invoked by the loop.in SIMP command, e.g.:
+score modules; trial force fields are evaluated through the optimizer's
+calculator (calculators.evaluate(ff) -> Datum list). Invoked by the loop.in
+SIMP command, e.g.:
     SIMP max_params=10
 """
 from __future__ import absolute_import
@@ -16,7 +18,6 @@ import logging
 import logging.config
 import textwrap
 
-import calculate
 import constants as co
 import data_structs
 import opt
@@ -42,10 +43,10 @@ class Simplex(opt.Optimizer):
     """
 
     def __init__(self, direc=None, ff=None, ff_lines=None,
-                 args_ff=None, args_ref=None):
+                 args_ff=None, args_ref=None, calculator=None):
         super(Simplex, self).__init__(
             direc=direc, ff=ff, ff_lines=ff_lines,
-            args_ff=args_ff, args_ref=args_ref)
+            args_ff=args_ff, args_ref=args_ref, calculator=calculator)
         self._max_cycles_wo_change = None
         self.do_massive_contraction = True
         self.do_weighted_reflection = True
@@ -59,12 +60,8 @@ class Simplex(opt.Optimizer):
 
         if self.ff.score is None:
             logger.log(20, "~~ CALCULATING INITIAL FF SCORE ~~".rjust(79, "~"))
-            self.ff.export_ff()
-            data = calculate.main(self.args_ff)
-            r_dict = score.data_by_type(r_data)
-            c_dict = score.data_by_type(data)
-            r_dict, c_dict = score.trim_data(r_dict, c_dict)
-            self.ff.score = score.compare_data(r_dict, c_dict)
+            data = self.calculator.evaluate(self.ff)
+            self.ff.score = score.score_data(r_data, data)
         else:
             logger.log(20, "  -- Reused existing score and data for initial FF.")
 
@@ -79,12 +76,8 @@ class Simplex(opt.Optimizer):
                 logger.log(15, "  -- Calculating new parameter derivatives.")
                 ffs = opt.differentiate_ff(self.ff, central=True)
                 for ff in ffs:
-                    ff.export_ff(path=self.ff.path, lines=self.ff_lines)
-                    data = calculate.main(self.args_ff)
-                    r_dict = score.data_by_type(r_data)
-                    c_dict = score.data_by_type(data)
-                    r_dict, c_dict = score.trim_data(r_dict, c_dict)
-                    ff.score = score.compare_data(r_dict, c_dict)
+                    data = self.calculator.evaluate(ff)
+                    ff.score = score.score_data(r_data, data)
                     opt.pretty_ff_results(ff)
                 opt.param_derivs(self.ff, ffs)
                 ffs = opt.extract_forward(ffs)
@@ -111,12 +104,8 @@ class Simplex(opt.Optimizer):
         # ensure all forward-differentiated FFs are scored
         for ff in self.new_ffs:
             if ff.score is None:
-                ff.export_ff(path=self.ff.path, lines=self.ff_lines)
-                data = calculate.main(self.args_ff)
-                r_dict = score.data_by_type(r_data)
-                c_dict = score.data_by_type(data)
-                r_dict, c_dict = score.trim_data(r_dict, c_dict)
-                ff.score = score.compare_data(r_dict, c_dict)
+                data = self.calculator.evaluate(ff)
+                ff.score = score.score_data(r_data, data)
                 opt.pretty_ff_results(ff)
 
         self.new_ffs = sorted(self.new_ffs + [ff_copy], key=lambda x: x.score)
@@ -162,12 +151,8 @@ class Simplex(opt.Optimizer):
                 inv_ff.params[i].value = inv_val
                 ref_ff.params[i].value = 2 * inv_val - self.new_ffs[-1].params[i].value
 
-            ref_ff.export_ff(path=self.ff.path, lines=self.ff.lines)
-            data = calculate.main(self.args_ff)
-            r_dict = score.data_by_type(r_data)
-            c_dict = score.data_by_type(data)
-            r_dict, c_dict = score.trim_data(r_dict, c_dict)
-            ref_ff.score = score.compare_data(r_dict, c_dict)
+            data = self.calculator.evaluate(ref_ff)
+            ref_ff.score = score.score_data(r_data, data)
             opt.pretty_ff_results(ref_ff)
 
             if ref_ff.score < last_best_ff.score:
@@ -179,12 +164,8 @@ class Simplex(opt.Optimizer):
                     exp_ff.params[i].value = (
                         3 * inv_ff.params[i].value
                         - 2 * self.new_ffs[-1].params[i].value)
-                exp_ff.export_ff(path=self.ff.path, lines=self.ff.lines)
-                data = calculate.main(self.args_ff)
-                r_dict = score.data_by_type(r_data)
-                c_dict = score.data_by_type(data)
-                r_dict, c_dict = score.trim_data(r_dict, c_dict)
-                exp_ff.score = score.compare_data(r_dict, c_dict)
+                data = self.calculator.evaluate(exp_ff)
+                exp_ff.score = score.score_data(r_data, data)
                 opt.pretty_ff_results(exp_ff)
                 if exp_ff.score < ref_ff.score:
                     self.new_ffs[-1] = exp_ff
@@ -208,12 +189,8 @@ class Simplex(opt.Optimizer):
                         con_val = ((3 * inv_ff.params[i].value
                                     - self.new_ffs[-1].params[i].value) / 2)
                     con_ff.params[i].value = con_val
-                self.ff.export_ff(params=con_ff.params)
-                data = calculate.main(self.args_ff)
-                r_dict = score.data_by_type(r_data)
-                c_dict = score.data_by_type(data)
-                r_dict, c_dict = score.trim_data(r_dict, c_dict)
-                con_ff.score = score.compare_data(r_dict, c_dict)
+                data = self.calculator.evaluate(con_ff)
+                con_ff.score = score.score_data(r_data, data)
                 opt.pretty_ff_results(con_ff)
 
                 if con_ff.score < self.new_ffs[-2].score:
@@ -226,12 +203,8 @@ class Simplex(opt.Optimizer):
                             ff.params[i].value = (
                                 (ff.params[i].value
                                  + self.new_ffs[0].params[i].value) / 2)
-                        self.ff.export_ff(params=ff.params)
-                        data = calculate.main(self.args_ff)
-                        r_dict = score.data_by_type(r_data)
-                        c_dict = score.data_by_type(data)
-                        r_dict, c_dict = score.trim_data(r_dict, c_dict)
-                        ff.score = score.compare_data(r_dict, c_dict)
+                        data = self.calculator.evaluate(ff)
+                        ff.score = score.score_data(r_data, data)
                         ff.method += " MC"
                         opt.pretty_ff_results(ff)
                 else:
@@ -261,7 +234,7 @@ class Simplex(opt.Optimizer):
         opt.pretty_ff_results(self.ff, level=20)
         opt.pretty_ff_results(best_ff, level=20)
         logger.log(20, "  -- Writing best force field from simplex.")
-        best_ff.export_ff(best_ff.path)
+        self.calculator.update_ff(best_ff)
         return best_ff
 
 

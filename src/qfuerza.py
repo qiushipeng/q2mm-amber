@@ -826,8 +826,7 @@ def main(args):
     assert (args.mol and args.log), "Both a .mol2 structure file and a Gaussian .log (reference Cartesian Hessian) file are needed!"
 
     if args.ff_in[-7:] == ".frcmod":
-        ff_in = AmberFF(args.ff_in)
-        ff_in.import_ff()
+        ff_in = utilities.AmberUtilities.read_frcmod(args.ff_in)
         logger.log(logging.INFO, "amber ff imported: {}".format(ff_in.path))
     else:
         raise NotImplemented()
@@ -920,8 +919,8 @@ def main(args):
             else:
                 raise NotImplemented()
             # Write out new FF
-            estimated_ff.export_ff( #TODO: MF - this should be in the masterclass FF, just an abstract method...
-                structs[i].origin_name + "." + args.ff_out, estimated_ff.params
+            utilities.AmberUtilities.write_frcmod( #TODO: MF - this should be in the masterclass FF, just an abstract method...
+                estimated_ff, structs[i].origin_name + "." + args.ff_out, estimated_ff.params
             )
     else:
         if isinstance(ff_in, AmberFF):
@@ -937,7 +936,7 @@ def main(args):
         
 
         # Write out new FF
-        estimated_ff.export_ff(args.ff_out, estimated_ff.params)
+        utilities.AmberUtilities.write_frcmod(estimated_ff, args.ff_out, estimated_ff.params)
 
 
 # endregion

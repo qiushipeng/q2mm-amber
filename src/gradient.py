@@ -5,10 +5,10 @@ gradient
 Gradient-based parameter optimization for q2mm-amber-main.
 
 Port of q2mm-master/q2mm/gradient.py adapted to use:
-    data_structs.* (was datatypes.*)
-    score.*        (was compare.*)
-    calculate.main (returns Datum list)
-    opt.*          helper functions
+    data_structs.*        (was datatypes.*)
+    score.*               (was compare.*)
+    calculators.evaluate  (an FF in, a Datum list out)
+    opt.*                 helper functions
 
 The Gradient class is configured via the loop.in GRAD command, e.g.:
     GRAD lstsq=True,radii=[1./10.]
@@ -30,7 +30,6 @@ import os
 
 import numpy as np
 
-import calculate
 import constants as co
 import data_structs
 import opt
@@ -70,10 +69,10 @@ class Gradient(opt.Optimizer):
     """
 
     def __init__(self, direc=None, ff=None, ff_lines=None,
-                 args_ff=None, args_ref=None):
+                 args_ff=None, args_ref=None, calculator=None):
         super(Gradient, self).__init__(
             direc=direc, ff=ff, ff_lines=ff_lines,
-            args_ff=args_ff, args_ref=args_ref)
+            args_ff=args_ff, args_ref=args_ref, calculator=calculator)
 
         # method enables
         self.do_lstsq = False
@@ -117,8 +116,7 @@ class Gradient(opt.Optimizer):
 
         if self.ff.data is None:
             logger.log(20, "~~ GATHERING INITIAL FF DATA ~~".rjust(79, "~"))
-            self.ff.export_ff()
-            self.ff.data = calculate.main(self.args_ff)
+            self.ff.data = self.calculator.evaluate(self.ff)
             score.correlate_energies(ref_data, self.ff.data)
 
         r_dict = score.data_by_type(ref_data)
@@ -174,9 +172,8 @@ class Gradient(opt.Optimizer):
             ffs = opt.differentiate_ff(self.ff)
             logger.log(20, "~~ SCORING DIFFERENTIATED PARAMETERS ~~".rjust(79, "~"))
             for ff in ffs:
-                ff.export_ff(lines=self.ff.lines)
                 logger.log(20, "  -- Calculating {}.".format(ff))
-                data = calculate.main(self.args_ff)
+                data = self.calculator.evaluate(ff)
                 c_data = score.data_by_type(data)
                 r_dict, c_data = score.trim_data(r_dict, c_data)
                 ff.score = score.compare_data(r_dict, c_data)
@@ -259,7 +256,7 @@ class Gradient(opt.Optimizer):
         if self.new_ffs:
             logger.log(20, "~~ EVALUATING TRIAL FF(S) ~~".rjust(79, "~"))
             for ff in self.new_ffs:
-                data = opt.cal_ff(ff, self.args_ff, parent_ff=self.ff)
+                data = opt.cal_ff(ff, self.calculator, parent_ff=self.ff)
                 c_data = score.data_by_type(data)
                 r_dict, c_data = score.trim_data(r_dict, c_data)
                 ff.score = score.compare_data(r_dict, c_data)
@@ -277,7 +274,7 @@ class Gradient(opt.Optimizer):
                 ff = self.ff
         else:
             ff = self.ff
-        ff.export_ff(ff.path)
+        self.calculator.update_ff(ff)
         return ff
 
 

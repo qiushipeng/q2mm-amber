@@ -11,7 +11,7 @@ search:
 |---|---|---|
 | `GRAD` | gradient least-squares (local) | refining parameters already close to right |
 | `SIMP` | simplex (local) | small polish, few parameters |
-| `SWARM` | hybrid particle-swarm + differential evolution (global) | seeds far from right, or a rough start |
+| `HYBR` | hybrid particle-swarm + differential evolution (global) | seeds far from right, or a rough start |
 
 ---
 
@@ -157,7 +157,7 @@ CT 12.010
 Extra free text is fine on either line — `# Q2MM  estimated input TSFF ...`
 works — and a title line may precede them.
 
-> **This fails silently.** Get the header wrong and `import_ff` returns **zero
+> **This fails silently.** Get the header wrong and `read_frcmod` returns **zero
 > parameters** with no error; `PARM` then reports `Trimmed number of parameters
 > down to 0` and the optimizer runs to completion having fitted nothing. All of
 > these yield 0 parameters:
@@ -206,7 +206,7 @@ ff_row  ff_col  [lower upper | neg | pos | both]
 force constants are exactly what the fit exists to determine; leave one out and
 its placeholder value survives into the final TSFF.
 
-> **`SWARM` requires finite bounds.** It seeds particles with
+> **`HYBR` requires finite bounds.** It seeds particles with
 > `np.random.uniform(lower, upper)`, so `inf` — including the `pos` / `neg` /
 > `both` keywords, which expand to infinite ranges — raises
 > `OverflowError: Range exceeds valid bounds`. `GRAD` and `SIMP` treat infinite
@@ -237,7 +237,7 @@ Commands run top to bottom.
 | `LOOP <conv> … END` | repeat the block until the score changes by < `conv` |
 | `GRAD [opts]` | gradient optimiser (§5) |
 | `SIMP [max_params=N]` | simplex optimiser |
-| `SWARM [opts]` | hybrid optimiser (§6) |
+| `HYBR [opts]` | hybrid optimiser (§6), inside `LOOP … END` |
 | `WGHT <typ> <w>` | override a per-type weight |
 | `STEP <ptype> <s>` | override a differentiation step |
 | `FXATM <file>` | exclude fixed atoms from the Hessian fit |
@@ -250,6 +250,7 @@ Commands run top to bottom.
 | property | reference (`RDAT`) | calculated (`CDAT`) |
 |---|---|---|
 | Hessian | `-gh MOL.log` | `-ah MOL.in` |
+| eigenmatrix (normal modes) | `-geigz MOL.log` | `-ageig MOL.in,MOL.log` |
 | bond lengths | `-gabo MOL.log` | `-abo MOL.in` |
 | angles | `-gaao MOL.log` | `-aao MOL.in` |
 | torsions | `-gato MOL.log` | `-ato MOL.in` |
@@ -266,6 +267,45 @@ frequency along the reaction coordinate); an MM force field can only produce
 positive curvature. `-i <value>` replaces that most-negative eigenvalue with
 `<value>`, turning the saddle point into a fittable minimum. It affects the
 **reference only**. Use it on every Hessian-fitting cycle of a TSFF.
+
+### Hessian fitting vs eigenmode fitting
+
+Both fit the curvature of the force field at the QM transition-state
+geometry to the QM curvature; they differ in the basis.
+
+* **Hessian fitting** (`-gh` / `-ah`) compares the mass-weighted Cartesian
+  Hessians element by element, every element weighted by how many bonds
+  apart its two atoms are (§7).
+* **Eigenmode fitting** (`-geigz` / `-ageig`) is the original Q2MM
+  objective, ported from upstream's hybrid-opt branch. The reference is the
+  diagonal matrix of the QM eigenvalues, one per normal mode, in
+  kJ/mol/Å²·amu. The calculated side is the force-field Hessian projected
+  onto the QM eigenvectors, `V·H·Vᵀ`: its diagonal is the force field's
+  curvature along each QM mode, its off-diagonals the coupling between modes,
+  which the reference has as zero. Weights: `eig_d_low` / `eig_d_high` for
+  diagonal elements (below / above 1100), `eig_o` for off-diagonals, and
+  `eig_i` for the transition-state mode *while its eigenvalue is still
+  negative*. With `-i` that element becomes positive and is weighted like any
+  other diagonal. `eig_i` defaults to 0, so without `-i` the imaginary mode is
+  simply left out of the fit.
+
+`-ageig` takes the leap input and the log together, comma-separated with no
+space, and can sit on the same line as the Hessian flags:
+
+```
+RDAT -gh MOL.log -geigz MOL.log -i 1
+CDAT -ah MOL.in -ageig MOL.in,MOL.log
+```
+
+Two requirements matter especially here:
+
+* run the Gaussian frequency job with **`nosymm`** and **`freq=hpmodes`**.
+  The eigenvectors are read from the printed normal coordinates: without
+  `hpmodes` they carry two decimals and are orthonormal only to a few percent,
+  and without `nosymm` they can be in a rotated frame.
+* the log and the mol2 must hold the same atoms, in the same order and the
+  same Cartesian frame (true for `-gh` as well). q2mm-amber compares the two
+  geometries and warns when they differ by more than 0.01 Å after centering.
 
 ### `FXATM` — fixed atoms
 
@@ -302,7 +342,9 @@ RDAT -gh Thio.log -i 4500
 FXATM fixedatoms.txt          # exclude these atoms from the Hessian fit
 CDAT -ah Thio.in
 COMP -o ./bafc_start.txt
-SWARM max_iter=200 pop_size=24 precision=0.001 tight=false n_processes=24
+LOOP 0.001
+HYBR --max_iter 200 --pop_size 24 --tight false --n_processes 24
+END
 FFLD write ./frcmod.gaff.01
 CDAT
 COMP -o ./bafc_opt.01.txt
@@ -393,7 +435,7 @@ COMP -o opt.txt
 
 ---
 
-## 6. Hybrid optimiser (`SWARM`)
+## 6. Hybrid optimiser (`HYBR`)
 
 A population of trial force fields ("particles") explores the parameter space
 by particle-swarm dynamics interleaved with differential-evolution steps. It is
@@ -401,31 +443,60 @@ a **global** search: far slower than `GRAD` but able to escape local minima and
 tolerate seeds that are badly wrong — which is the normal situation for
 forming/breaking TS coordinates.
 
-It is the AMBER-path analogue of the `HYBR` command on upstream's
-[`hybrid-opt`](https://github.com/Q2MM/q2mm/tree/hybrid-opt) branch, which it
-derives from. Source: `src/opt.py::SwarmOptimizer` →
-`src/hybrid_optimizer.py::PSO_DE`.
+It is the AMBER-path port of the `HYBR` command on upstream's
+[`hybrid-opt`](https://github.com/Q2MM/q2mm/tree/hybrid-opt) branch and keeps
+its logic. Source: `src/opt.py::SwarmOptimizer` →
+`src/hybrid_optimizer.py::PSO_DE`; every particle is evaluated by
+`src/calculators.py::AmberCalculator`.
 
 ### Synopsis
 
 ```
-SWARM [max_iter=N] [pop_size=N] [precision=F] [tight=T|F] [n_processes=N]
+LOOP <conv>
+HYBR [--max_iter N] [--pop_size N] [--tight T|F] [--n_processes N]
+END
 ```
 
-* Options are `key=value`, space-separated, **order-independent**.
-* Tokens without `=` are ignored; unknown keys are silently ignored.
-* A bare `SWARM` is valid and uses all defaults.
-* **`SWARM` is not placed inside `LOOP … END`** — it manages its own iterations.
+* Options are `--name value` pairs, space-separated, **order-independent**.
+  An unknown option is an error.
+* A bare `HYBR` is valid and uses all defaults.
+* **`HYBR` goes inside a `LOOP … END` block**, like `GRAD`. The block's
+  convergence value drives the swarm (next section).
 
 ### Options
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `max_iter` | int | **200** | maximum PSO/DE iterations (hard cap) |
-| `pop_size` | int | **24** | number of particles — **must be even** |
-| `precision` | float | **0.001** | early-stop tolerance on swarm *localisation* |
-| `tight` | T/F | **true** | tight (refine) vs global (explore) starting spread |
-| `n_processes` | int | **1** | parallel Amber evaluations; `1` = serial |
+| `--max_iter` | int | **200** | PSO/DE iterations per `LOOP` cycle (hard cap) |
+| `--pop_size` | int | **24** | number of particles — **must be even** |
+| `--tight` | T/F | **true** | tight (refine) vs global (explore) starting spread |
+| `--n_processes` | int | **1** | parallel Amber evaluations; `1` = serial |
+
+The options are read when the swarm is created, on the first `HYBR` of a
+`LOOP` block; the block's later cycles reuse them.
+
+### How the `LOOP` drives it
+
+The `LOOP <conv>` value does two jobs, as in upstream Q2MM:
+
+1. **Between cycles** it is the usual loop test: after each `HYBR` cycle the
+   block repeats until the score changes by less than `conv` (relative), or
+   stops changing.
+2. **Within a cycle** it is the swarm's own early-stop tolerance: the cycle
+   ends before `max_iter` once *every* particle has stayed within `conv` of
+   the best particle, in *every* parameter, for **20 consecutive
+   iterations**. That distance is absolute, in each parameter's own units, so
+   for force constants spanning 1–1500 a `conv` of `0.001` essentially never
+   fires and `max_iter` governs the cycle length. A larger value (eg `1`)
+   lets the early stop trigger.
+
+The swarm **persists across the cycles of one `LOOP` block**: the second
+`HYBR` continues the same particles from where the first stopped, around the
+best force field found so far, with the PSO/DE hyperparameters frozen at
+their final values (the first cycle tapers them from the exploring to the
+exploiting end). A new `LOOP` block starts a fresh swarm around the current
+force field. A cycle never returns a worse force field than it was given, so
+an unimproved cycle ends the block.
 
 ### How a particle is scored
 
@@ -437,45 +508,33 @@ Each **particle is one complete parameter vector**. To score it the optimiser:
 3. compares calculated vs reference data with `score.compare_data`.
 
 The swarm **minimises** that score (§7). A particle whose evaluation throws is
-given score `inf` and discarded. `SWARM` uses the **same objective** as
+given score `inf` and discarded. `HYBR` uses the **same objective** as
 `GRAD`/`SIMP` — only the search differs.
 
 ### Option semantics in depth
 
-**`pop_size`** — the search dimensionality is the number of selected
+**`--pop_size`** — the search dimensionality is the number of selected
 parameters. Larger populations cover the space better at linearly more cost per
 iteration. Rule of thumb: several × the number of parameters (≈6×), and a
 global search wants more than a tight one. **Must be even** (asserted, for the
 DE step).
 
-**`max_iter`** — the dominant cost knob:
+**`--max_iter`** — the dominant cost knob:
 
 ```
-wall-time ≈ pop_size × max_iter × (Amber eval time) / n_processes
+wall-time per cycle ≈ pop_size × max_iter × (Amber eval time) / n_processes
 ```
 
 (DE steps taper off over the run, so the real cost is a little lower). It is an
-upper bound — the run can stop earlier via `precision`.
+upper bound per cycle — a cycle can stop earlier through the `LOOP`
+convergence, and the block runs as many cycles as that convergence needs.
 
-**`precision`** — **not a score tolerance.** It is an early-stop test on how
-tightly the swarm has **localised in parameter space**: after each iteration,
-if *every* particle lies within `precision` of the best particle in *every*
-dimension, and that holds for more than **N = 20 consecutive iterations**, the
-run stops.
-
-* The distance is **absolute**, in each parameter's own units (the older
-  scale-by-value behaviour was removed).
-* Consequence: for force constants spanning 1–1500, `precision=0.001` is ~10⁻⁶
-  relative — so tight it essentially **never fires**, and `max_iter` alone
-  governs run length. Use a much larger value (eg `1`) if you want the
-  early-stop to trigger.
-
-**`tight`** — selects only the **starting spread**, not the core PSO/DE
+**`--tight`** — selects only the **starting spread**, not the core PSO/DE
 hyperparameters (a single `DEFAULT_CONFIG`: inertia 0.9→0.4, cognitive
 2.5→0.5, social 0.5→2.5, `DE/best/1`, differential weight 0.4→0.1, taper-GA
 on). It changes:
 
-| | `tight=true` (refine) | `tight=false` (global) |
+| | `--tight true` (refine) | `--tight false` (global) |
 |---|---|---|
 | particles tethered near current values | 70 % | 30 % |
 | initial spread of `af`/`bf` parameters | 0.125 | 1.0 |
@@ -484,16 +543,16 @@ Per-type initial deviations: `af`/`bf` → 0.125 or 1.0; `ae` → 15; `be` → 0
 `df` → 5; everything else → 1.0.
 
 Accepted true values are `t`, `true`, `1`, `yes`, **case-insensitive**;
-anything else is false. So `tight=TRUE` and `tight=T` both mean tight, while
-`tight=G`, `tight=false` — and also `tight=tight`, which is not in the list —
-all mean global.
+anything else is false. So `--tight TRUE` and `--tight T` both mean tight,
+while `--tight G`, `--tight false` — and also `--tight tight`, which is not in
+the list — all mean global.
 
-**`n_processes`** — speed only, never the result:
+**`--n_processes`** — speed only, never the result:
 
 * `1` (default) — **serial**, one Amber evaluation at a time, no extra dirs.
 * `>1` — **parallel**: creates `swarm_particles/p_000 … p_{pop_size-1}`, copies
-  the `frcmod`, `.in` and `.mol2` into each so concurrent `tleap`/Amber jobs
-  cannot collide, and runs `n_processes` workers.
+  the `.in` and every input file it names (`frcmod`, `mol2`, …) into each so
+  concurrent `tleap`/Amber jobs cannot collide, and runs `n_processes` workers.
 
 Set it ≤ your reserved cores. It is silently capped at `pop_size` (more workers
 than particles is useless) and at the available cores.
@@ -517,7 +576,9 @@ RDAT -gh MOL.log -i 1
 FXATM fixedatoms.txt
 CDAT -ah MOL.in
 COMP -o start.txt
-SWARM max_iter=200 pop_size=24 precision=0.001 tight=false n_processes=24
+LOOP 0.001
+HYBR --max_iter 200 --pop_size 24 --tight false --n_processes 24
+END
 FFLD write frcmod.gaff.01
 CDAT
 COMP -o opt.txt
@@ -527,11 +588,11 @@ COMP -o opt.txt
 
 | situation | command |
 |---|---|
-| smoke test (does it run at all?) | `SWARM max_iter=2 pop_size=4 n_processes=4` |
-| refine an already-good FF | `SWARM max_iter=300 pop_size=24 tight=true n_processes=8` |
-| global search from seeds | `SWARM max_iter=1000 pop_size=48 tight=false n_processes=24` |
+| smoke test (does it run at all?) | `HYBR --max_iter 2 --pop_size 4 --n_processes 4` |
+| refine an already-good FF | `HYBR --max_iter 300 --pop_size 24 --tight true --n_processes 8` |
+| global search from seeds | `HYBR --max_iter 1000 --pop_size 48 --tight false --n_processes 24` |
 
-`SWARM` is **stochastic** — there is no fixed random seed, so two runs differ.
+`HYBR` is **stochastic** — there is no fixed random seed, so two runs differ.
 Give it enough `pop_size`/`max_iter` for a stable result, and consider
 repeating a production run.
 
@@ -552,6 +613,9 @@ score = Σ over types  (1 / N_type) · Σ over points  w² · (reference − cal
   `h` 0.031 …) and can be overridden with `WGHT`
 * Hessian elements get an additional per-element weight by topology:
   diagonal `0`, 1-2 and 1-3 `0.031`, 1-4 `0.31`, longer range `0.031`
+* eigenmatrix elements use `eig_d_low` / `eig_d_high` (`0.1`) on the
+  diagonal, `eig_o` (`0.05`) off it, and `eig_i` (`0`) for an un-inverted
+  transition-state mode (§4)
 
 The printed `Score` column is the per-element contribution **after** the
 `1/N_type` division, shown to 4 decimals. Most Hessian rows therefore print
@@ -598,13 +662,14 @@ python $SRC/loop.py loop.in
 |---|---|
 | `frcmod.gaff.01` | the optimised force field |
 | `start.txt` / `opt.txt` | full data comparison before / after |
+| `ff_001.frcmod`, `ff_002.frcmod`, … | the best force field after each `LOOP` cycle; numbering continues from files already present |
 | `root.log` | complete run log, including per-iteration best scores |
-| `calc/` | Amber scratch: `prmtop`, `inpcrd`, `.hes`, `geo.npy` |
-| `swarm_particles/` | per-particle scratch (parallel `SWARM` only) |
+| `calc/` | Amber scratch: `prmtop`, `inpcrd`, `.ene`, `.geo`, `.hes` |
+| `swarm_particles/` | per-particle scratch (parallel `HYBR` only) |
 
 Compare `start.txt` with `opt.txt` — the `Total score` lines give the
 improvement, and the per-type breakdown underneath shows where it came from.
-The log carries `INIT FF SCORE` and, for `SWARM`, a per-iteration
+The log carries `INIT FF SCORE` and, for `HYBR`, a per-iteration
 `Iter: k, Best fit: … at [params]` trace.
 
 ---
@@ -635,7 +700,7 @@ terms.
 
 | symptom | cause and fix |
 |---|---|
-| `OverflowError: Range exceeds valid bounds` | a `SWARM` parameter has an infinite bound. Put finite `lower upper` on every line of `params.txt`. |
+| `OverflowError: Range exceeds valid bounds` | a `HYBR` parameter has an infinite bound. Put finite `lower upper` on every line of `params.txt`. |
 | `AssertionError` on `size_pop` | `pop_size` must be an **even** integer. |
 | `Trimmed number of parameters down to 0` | the `frcmod` header is wrong — `# Q2MM` and `# OPT` must be on **separate** lines, in that order, before `MASS` (§2). |
 | `Total Num. data points: 0`, every score `0.0` | no data was produced — almost always `tleap` failing. Check `calc/prmtop` is non-zero and read `leap.log`. |
@@ -643,5 +708,6 @@ terms.
 | `Hessian file missing: …hes` | `nab`/`nmode` produced no `hessian.mat`. Either the earlier steps failed (check `prmtop`), or AmberTools is not patched (§0). |
 | `FileExistsError: … swarm_particles/p_000` | leftovers from a previous run. Delete `swarm_particles/` first. |
 | score barely moves while parameters change a lot | the objective is dominated by residuals your selected parameters cannot affect — typically a forming/breaking contact left **unbonded** in the `mol2`, which Amber then scores as a nonbonded clash with a huge Hessian. Fix the topology, not the optimiser. |
-| `SWARM` used fewer workers than requested | `n_processes` is silently capped at `pop_size` and at the available cores. Speed only; results are unaffected. |
-| two runs give different answers | expected — `SWARM` is stochastic with no fixed seed. |
+| `HYBR` used fewer workers than requested | `n_processes` is silently capped at `pop_size` and at the available cores. Speed only; results are unaffected. |
+| two runs give different answers | expected — `HYBR` is stochastic with no fixed seed. |
+| `HYBR: unrecognised option(s)` | options are `--name value` pairs (`--max_iter 200`); the old `name=value` form and `precision` are gone — the `LOOP` convergence is the precision now. |

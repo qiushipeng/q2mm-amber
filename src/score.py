@@ -19,7 +19,9 @@ data_by_type(data)              Bucket Datum objects by their .typ string.
 trim_data(r_dict, c_dict)       Drop unmatched data points from both sides.
 correlate_energies(r, c)        Zero each energy group to its minimum.
 import_weights(data)            Stamp weights from constants.WEIGHTS onto data.
+hessian_element_weight(sep)     Per-element Hessian weight from the atoms' bond separation.
 compare_data(r_dict, c_dict)    Run the objective function. Returns score (float).
+score_data(ref_data, calc_data) Bucket, trim and compare two Datum lists. Returns score.
 """
 from __future__ import absolute_import
 from __future__ import division
@@ -120,20 +122,50 @@ def correlate_energies(r_data, c_data):
             c_arr[ind].val -= zero
 
 
+def hessian_element_weight(sep):
+    """
+    Per-element weight of a calculated Hessian element from the bond
+    separation of its two atoms (Datum.sep), per the Q2MM paper:
+      0  same atom (3x3 diagonal block)         0.0  (no contribution)
+      1  bonded (1 bond apart)                   WEIGHTS['h12']
+      2  angle endpoints (2 bonds apart)         WEIGHTS['h13']
+      3  dihedral endpoints (3 bonds apart)      WEIGHTS['h14']
+      4  further apart (long range)              WEIGHTS['h']
+    The 1-4 terms are emphasized (0.31) to represent the TS as a minimum.
+    """
+    if sep == 0:
+        return 0.0
+    if sep == 1:
+        return co.WEIGHTS["h12"]
+    if sep == 2:
+        return co.WEIGHTS["h13"]
+    if sep == 3:
+        return co.WEIGHTS["h14"]
+    return co.WEIGHTS["h"]
+
+
 def import_weights(data):
     """
     Stamp the weight attribute on every Datum that doesn't already have one.
-    Uses constants.WEIGHTS. Eigenvalue weights are handled specially:
-      eig_i      first diagonal element
-      eig_d_low  remaining diagonals with val < 1100
-      eig_d_high remaining diagonals with val >= 1100
+    Uses constants.WEIGHTS. Calculated Hessian elements, which carry the bond
+    separation of their atoms (Datum.sep), get hessian_element_weight;
+    reference Hessian elements get the uniform WEIGHTS['h']. Eigenmatrix
+    weights follow upstream q2mm's hybrid-opt branch:
+      eig_i      the (1,1) element while its value is still negative, i.e.
+                 the un-inverted transition-state mode (0 by default, so the
+                 imaginary mode is left out of the fit); once inverted with
+                 -i it is weighted like any other diagonal element
+      eig_d_low  diagonals with val < 1100
+      eig_d_high diagonals with val >= 1100
       eig_o      off-diagonals
     """
     for datum in data:
         if datum.wht is not None:
             continue
-        if datum.typ == "eig":
-            if datum.idx_1 == datum.idx_2 == 1:
+        if datum.typ == "h" and datum.sep is not None:
+            datum.wht = hessian_element_weight(datum.sep)
+        elif datum.typ == "eig":
+            if datum.idx_1 == datum.idx_2 == 1 and datum.val < 0.0:
                 datum.wht = co.WEIGHTS["eig_i"]
             elif datum.idx_1 == datum.idx_2:
                 datum.wht = (
@@ -239,13 +271,14 @@ def compare_data(r_dict, c_dict, output=None, doprint=False, strict=True):
                 norm = len(c_dict[typ]) if len(c_dict[typ]) else 1
                 disp_wht = c.wht
                 # FXATM: drop the LONG-RANGE Hessian couplings of a fixed atom,
-                # matching q2mm-master (bonded 1-2/1-3/1-4 terms are kept). c.hlr
-                # is stamped True at build time only for the long-range class.
-                # Applied here (score time) so it is placement-proof -- FXATM only
-                # has to precede the COMP/SWARM that scores, not the CDAT that
-                # built the data. Overrides the printed Weight column too, so
-                # start/opt stay consistent. co.FIXED_ATOMS defaults to empty.
-                if getattr(co, "FIXED_ATOMS", None) and getattr(c, "hlr", False) \
+                # matching q2mm-master (bonded 1-2/1-3/1-4 terms are kept). c.sep
+                # is the atoms' bond separation stamped at build time; > 3 is
+                # the long-range class. Applied here (score time) so it is
+                # placement-proof -- FXATM only has to precede the COMP/HYBR
+                # that scores, not the CDAT that built the data. Overrides the
+                # printed Weight column too, so start/opt stay consistent.
+                # co.FIXED_ATOMS defaults to empty.
+                if getattr(co, "FIXED_ATOMS", None) and c.sep is not None and c.sep > 3 \
                         and (c.atm_1 in co.FIXED_ATOMS or c.atm_2 in co.FIXED_ATOMS):
                     disp_wht = 0.0
                 score = (disp_wht ** 2 * diff ** 2) / norm
@@ -301,3 +334,15 @@ def compare_data(r_dict, c_dict, output=None, doprint=False, strict=True):
             print(line)
 
     return score_tot
+
+
+def score_data(ref_data, calc_data, output=None, doprint=False):
+    """
+    Score a calculated Datum list against the reference one: bucket both by
+    type, drop unmatched points, and run compare_data. This is the single
+    step every optimizer takes from a Calculator's output to a score.
+    """
+    r_dict = data_by_type(ref_data)
+    c_dict = data_by_type(calc_data)
+    r_dict, c_dict = trim_data(r_dict, c_dict)
+    return compare_data(r_dict, c_dict, output=output, doprint=doprint)
