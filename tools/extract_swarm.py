@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Recover swarm data from a q2mm-amber SWARM run's log and particle dirs.
+Recover swarm data from a q2mm-amber HYBR run's log and particle dirs.
 
 Two uses:
 
 1. Runs that predate the history dump. `loop.py._dump_swarm_history` now
-   writes `hybrid_opt_history.bin` at the end of every SWARM run, but runs
+   writes `hybrid_opt_history.bin` at the end of every HYBR cycle, but runs
    made before that change have no pickle at all. This is the only way to
    get anything out of them.
 
