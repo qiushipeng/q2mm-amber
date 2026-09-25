@@ -664,7 +664,7 @@ python $SRC/loop.py loop.in
 | `start.txt` / `opt.txt` | full data comparison before / after |
 | `ff_001.frcmod`, `ff_002.frcmod`, … | the best force field after each `LOOP` cycle; numbering continues from files already present |
 | `root.log` | complete run log, including per-iteration best scores |
-| `calc/` | Amber scratch: `prmtop`, `inpcrd`, `.ene`, `.geo`, `.hes` |
+| `calc/` | Amber scratch: `prmtop`, `inpcrd`, `.ene`, `.lst` (topology listing; sets the Hessian weights), `.geo`, `.hes` |
 | `swarm_particles/` | per-particle scratch (parallel `HYBR` only) |
 
 Compare `start.txt` with `opt.txt` — the `Total score` lines give the

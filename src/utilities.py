@@ -1162,6 +1162,7 @@ class AmberUtilities(object):
         cpptraj_measure_input(...), nab_hessian_input(pdb, prmtop)
     Engine outputs
         parse_cpptraj_listing(lines)   -> (bonds, angles, torsions) atom-index lists
+        cpptraj_finished(lines)        -> whether cpptraj's output reaches its closing TIME line
         read_measurements(path)        -> last-frame values of a cpptraj `out` file
         geo_summary(...)               -> the BONDS/ANGLES/TORSIONS/END text AmberGeo reads
         read_hessian / read_energies / read_geometry(path) -> AmberHess/AmberEne/AmberGeo
@@ -1368,7 +1369,10 @@ nmode( x, 3*m.natoms, mme2, 0, 0, 0.0, 0.0, 0);"""
         Return a copy of `lines` with the value of every parameter in
         `params` written into its row (ff_row) and column (ff_col). Rows the
         parameters do not touch are returned unchanged, so the template can
-        be any earlier rendering of the same file.
+        be any earlier rendering of the same file. Whether a row is a bond,
+        angle or dihedral/improper comes from the parameter type, not from
+        the text, so a hyphen in a comment cannot change how it is written; a
+        type with no frcmod column here (a legacy "vdw") leaves its row alone.
         """
         lines = list(lines)
         for param in params:
@@ -1382,27 +1386,29 @@ nmode( x, 3*m.natoms, mme2, 0, 0, 0.0, 0.0, 0);"""
             space3 = " " * 3
             col = int(param.ff_col - 1)
             value = "{:7.4f}".format(param.value)
-            tempsplit = line.split("-")
-            leng = len(tempsplit)
             AA = None
             BB = None
-            if leng == 2:
+            if param.ptype in ("bf", "be"):
                 # Bond
                 nl = 2 + 3
                 AA = line[:nl].split("-")
                 BB = line[nl:].split()
                 atoms = "-".join([format(el, "<2") for el in AA]) + space3 * 5
                 BB[col] = value
-                const = "".join([format(el, ">12") for el in BB])
-            elif leng == 3:
+                const = "".join([format(el, ">12") for el in BB[:2]])
+                if len(BB) > 2:
+                    const += space3 + " ".join(BB[2:])
+            elif param.ptype in ("af", "ae"):
                 # Angle
                 nl = 2 + 3 * 2
                 AA = line[:nl].split("-")
                 BB = line[nl:].split()
                 atoms = "-".join([format(el, "<2") for el in AA]) + space3 * 4
                 BB[col] = value
-                const = "".join([format(el, ">12") for el in BB])
-            elif leng >= 4:
+                const = "".join([format(el, ">12") for el in BB[:2]])
+                if len(BB) > 2:
+                    const += space3 + " ".join(BB[2:])
+            elif param.ptype in ("df", "imp1"):
                 # Dihedral/Improper
                 nl = 2 + 3 * 3
                 AA = line[:nl].split("-")
@@ -1426,6 +1432,9 @@ nmode( x, 3*m.natoms, mme2, 0, 0, 0.0, 0.0, 0);"""
                         + space3
                         + " ".join(BB[4:])
                     )
+            else:
+                logger.warning("{} has no frcmod column to write; row left as it is.".format(param))
+                continue
             lines[param.ff_row - 1] = atoms + const + "\n"
         return lines
 
@@ -1550,6 +1559,16 @@ nmode( x, 3*m.natoms, mme2, 0, 0, 0.0, 0.0, 0);"""
             elif "Atom4" in line:
                 count = 3
         return bonds, angles, torsions
+
+    @staticmethod
+    def cpptraj_finished(lines):
+        """
+        Whether cpptraj's output reaches its closing "TIME: Total execution
+        time" line; output cut off before it (cpptraj killed, disk full) is
+        incomplete. cpptraj prints the line after an error as well, so only
+        its exit status tells a failed run from a finished one.
+        """
+        return any(line.startswith("TIME: Total execution time") for line in lines)
 
     @staticmethod
     def read_measurements(path):

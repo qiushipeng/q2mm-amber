@@ -49,9 +49,9 @@ import numpy as np
 
 import constants as co
 import math_util
-from data_structs import (AmberFF, Datum, Structure, datum_from_energy,
-                          datums_from_eigenmatrix, datums_from_geometry,
-                          datums_from_hessian)
+from data_structs import (AmberFF, Angle, Bond, Datum, Structure, Torsion,
+                          datum_from_energy, datums_from_eigenmatrix,
+                          datums_from_geometry, datums_from_hessian)
 from utilities import AmberLeapInput, AmberUtilities, Frcmod
 
 logging.config.dictConfig(co.LOG_SETTINGS)
@@ -253,9 +253,12 @@ class AmberCalculator(Calculator):
     The pipeline, per calculate():
         tleap                      calc/prmtop, calc/inpcrd   (update_topology)
         sander (min or sp)         calc/<prefix>.<name>.ene, .rst
+        cpptraj topology listing   calc/<prefix>.<name>.lst   (geometry commands)
         sander 0-step MD + cpptraj calc/<prefix>.<name>.geo   (geometry commands)
         antechamber + nab/nmode    calc/<prefix>.<name>.hes   (ah / ageig)
-    Everything Amber prints goes to <work_dir>/<prefix>.<name>.log.
+    Everything Amber prints goes to <work_dir>/<prefix>.<name>.log. Each
+    step deletes its old outputs before it runs, so a step that fails leaves
+    nothing behind that could be read as this force field's result.
 
     "ah" reports the Hessian element by element; "ageig" reports it projected
     on the reference normal modes given as `eigenvectors` (eigenmode fitting).
@@ -363,6 +366,12 @@ class AmberCalculator(Calculator):
         with open(self._path(rel), "w") as f:
             f.write(text)
 
+    def _remove(self, *rels):
+        """Delete these outputs of an earlier run, where they exist."""
+        for rel in rels:
+            if os.path.isfile(self._path(rel)):
+                os.remove(self._path(rel))
+
     def _run(self, command):
         runner = self.runner if self.runner is not None else run_shell
         logger.log(5, "RUNNING in {}: {}".format(self.work_dir, command))
@@ -388,9 +397,7 @@ class AmberCalculator(Calculator):
         deleted first so a failing leap script cannot leave a stale topology
         behind; both must exist afterwards.
         """
-        for rel in (self.PRMTOP, self.INPCRD):
-            if os.path.isfile(self._path(rel)):
-                os.remove(self._path(rel))
+        self._remove(self.PRMTOP, self.INPCRD)
         self._run("tleap -f {}".format(self.leap_input.filename))
         missing = [rel for rel in (self.PRMTOP, self.INPCRD)
                    if not os.path.isfile(self._path(rel))]
@@ -468,11 +475,16 @@ class AmberCalculator(Calculator):
     # -- pipeline steps ------------------------------------------------------
 
     def _run_sander(self):
-        """Minimize (or single-point) from calc/inpcrd; writes .ene and .rst."""
+        """
+        Minimize (or single-point) from calc/inpcrd; writes .ene and .rst.
+        The old ones are deleted first: a crashed sander run must leave no
+        energy or coordinates of an earlier force field behind.
+        """
         maxcyc, ncyc = self.MIN_CYCLES if self.minimize else self.SP_CYCLES
         min_in = self._calc_name("min")
         ene = self._calc_name("ene")
         rst = self._calc_name("rst")
+        self._remove(ene, rst)
         self._write(min_in, AmberUtilities.sander_min_input(maxcyc, ncyc))
         self._run("sander -O -i {} -o {} -p {} -c {} -r {}".format(
             min_in, ene, self.PRMTOP, self.INPCRD, rst))
@@ -494,25 +506,36 @@ class AmberCalculator(Calculator):
     def _measure_geometry(self):
         """
         Write the minimized (or single-point) coordinates as a trajectory
-        frame, list every bond/angle/dihedral of the topology with cpptraj,
-        measure them all on that frame, and leave the BONDS/ANGLES/TORSIONS
-        summary in calc/<prefix>.<name>.geo for AmberGeo.
+        frame, list every bond/angle/dihedral of the topology with cpptraj
+        (kept in calc/<prefix>.<name>.lst: the connectivity the Hessian
+        weights come from), measure them all on that frame, and leave the
+        BONDS/ANGLES/TORSIONS summary in calc/<prefix>.<name>.geo for
+        AmberGeo. When sander left no coordinates nothing is measured, and
+        the summary lists no values. A failed or incomplete listing stops
+        the calculation.
         """
         dyn = self._calc_name("dyn")
         rst = self._calc_name("rst")
         nc = self._calc_name("nc")
         listing_in = self._calc_name("int")
+        listing = self._calc_name("lst")
         geo = self._calc_name("geo")
+        out_prefix = os.path.join("calc", self.prefix)
+        self._remove(nc, listing, geo, out_prefix + ".bonds", out_prefix + ".angles",
+                     out_prefix + ".torsions")
         self._write(dyn, AmberUtilities.sander_traj_input())
         self._run("sander -O -i {} -o calc/traj.out -p {} -c {} -x {}".format(
             dyn, self.PRMTOP, rst, nc))
         self._write(listing_in, AmberUtilities.cpptraj_list_input())
-        self._run("cpptraj -p {} < {} > {}".format(self.PRMTOP, listing_in, geo))
-        if not os.path.isfile(self._path(geo)):
-            raise CalculationError("cpptraj produced no interaction listing {}".format(geo))
-        with open(self._path(geo), "r") as f:
-            bonds, angles, torsions = AmberUtilities.parse_cpptraj_listing(f.readlines())
-        out_prefix = os.path.join("calc", self.prefix)
+        status = self._run("cpptraj -p {} < {} > {}".format(self.PRMTOP, listing_in, listing))
+        interactions = None if status else self._read_listing()
+        if interactions is None:
+            # The shell creates the listing whatever cpptraj does; a failed or
+            # partial one must not be left behind for the Hessian weights.
+            self._remove(listing)
+            raise CalculationError("cpptraj gave no complete bond/angle/dihedral listing "
+                                   "of {} (see {})".format(self.PRMTOP, self.log_path))
+        bonds, angles, torsions = interactions
         measure_in = os.path.join("calc", self.name + ".temp")
         self._write(measure_in, AmberUtilities.cpptraj_measure_input(
             nc, bonds, angles, torsions, out_prefix))
@@ -529,9 +552,13 @@ class AmberCalculator(Calculator):
         Mass-weighted Hessian with nab/nmode at the mol2 geometry (the QM
         transition state, via <name>.pdb), on the current topology. Needs
         the nmode patch that writes calc/hessian.mat (OPTIMIZATION.md
-        section 0); the file is moved to calc/<prefix>.<name>.hes.
+        section 0); the file is moved to calc/<prefix>.<name>.hes. The old
+        Hessian is deleted first, so a failed run cannot have an earlier
+        force field's Hessian scored in its place.
         """
         pdb = self.name + ".pdb"
+        mat = os.path.join("calc", "hessian.mat")
+        self._remove(mat, self._calc_name("hes"))
         if not os.path.isfile(self._path(pdb)):
             self._run("antechamber -dr no -i {0}.mol2 -fi mol2 -o {0}.pdb -fo pdb".format(self.name))
         nab_in = os.path.join("calc", self.name + ".nab")
@@ -539,7 +566,7 @@ class AmberCalculator(Calculator):
         self._write(nab_in, AmberUtilities.nab_hessian_input(pdb, "./" + self.PRMTOP))
         self._run("nab -v {} -o {}".format(nab_in, nab_bin))
         self._run("./" + nab_bin)
-        produced = self._path(os.path.join("calc", "hessian.mat"))
+        produced = self._path(mat)
         if os.path.isfile(produced):
             os.replace(produced, self._path(self._calc_name("hes")))
         else:
@@ -577,26 +604,53 @@ class AmberCalculator(Calculator):
             return []
         if self.invert is not None:
             H = math_util.invert_lowest_eigenvalue(H, self.invert, label=self.name_hes)
-        structure = self._measured_structure()
+        structure = self._connectivity()
         if structure is None:
-            logger.warning("No geometry summary in {}; every off-diagonal Hessian "
-                           "element counts as long range.".format(self.calc_dir))
-            structure = Structure(self.name_geo)
+            # Without the connectivity every element would count as long range
+            # and lose the 1-4 weight, scoring far better than it is.
+            logger.warning("No complete topology listing in {}; the Hessian cannot "
+                           "be weighted, so it is not reported.".format(self.calc_dir))
+            return []
         # The .hes filename makes the Datum label collapse to "amber" (the
         # piece before the first dot), matching q2mm-master's label format.
         return datums_from_hessian(H, self.name_hes, structure=structure)
 
-    def _measured_structure(self):
+    def _read_listing(self):
         """
-        The structure cpptraj measured (calc/<prefix>.<name>.geo); its bonds,
-        angles and torsions give the Hessian elements' atom-pair separations.
-        None when the summary is missing.
+        (bonds, angles, torsions) from the cpptraj listing
+        calc/<prefix>.<name>.lst. None when the listing is missing, stops
+        before cpptraj's closing TIME line (a listing cut off after the bonds
+        would turn every 1-4 pair into a long-range one), or lists no bonds.
         """
-        geo_path = os.path.join(self.calc_dir, self.name_geo)
-        if not os.path.isfile(geo_path):
+        path = self._path(self._calc_name("lst"))
+        if not os.path.isfile(path):
             return None
-        structures = AmberUtilities.read_geometry(geo_path).structures
-        return structures[0] if structures else None
+        with open(path, "r") as f:
+            lines = f.readlines()
+        if not AmberUtilities.cpptraj_finished(lines):
+            return None
+        bonds, angles, torsions = AmberUtilities.parse_cpptraj_listing(lines)
+        if not bonds:
+            return None
+        return bonds, angles, torsions
+
+    def _connectivity(self):
+        """
+        The bonds, angles and torsions of the topology, from the cpptraj
+        listing (calc/<prefix>.<name>.lst); they give the Hessian elements'
+        atom-pair separations. Unlike the measured geometry they do not depend
+        on sander, so a crashed minimization cannot change the weights. None
+        when the listing is missing, incomplete or lists no bonds.
+        """
+        interactions = self._read_listing()
+        if interactions is None:
+            return None
+        bonds, angles, torsions = interactions
+        structure = Structure(os.path.basename(self._calc_name("lst")))
+        structure.bonds.extend(Bond(atom_nums=atoms) for atoms in bonds)
+        structure.angles.extend(Angle(atom_nums=atoms) for atoms in angles)
+        structure.torsions.extend(Torsion(atom_nums=atoms) for atoms in torsions)
+        return structure
 
     def _energy_data(self, typ):
         ene_path = os.path.join(self.calc_dir, self.name_ene)
