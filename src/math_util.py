@@ -226,4 +226,77 @@ def project_hessian(hessian: np.ndarray, eigenvectors: np.ndarray) -> np.ndarray
             eigenvectors.shape, hessian.shape))
     return eigenvectors.dot(hessian).dot(eigenvectors.T)
 
+
+def vibrational_modes(hessian: np.ndarray, coords, masses) -> Tuple[np.ndarray, np.ndarray]:
+    """The normal modes of a mass-weighted Hessian, found the way Gaussian finds
+    the ones it prints: rigid-body translation and rotation are projected out
+    and the Hessian is diagonalized in the remaining 3N-6 (3N-5 for a linear
+    molecule) dimensions.
+
+    Args:
+        hessian (np.ndarray): 3N x 3N mass-weighted Hessian
+        coords: N x 3 Cartesian coordinates (Angstrom) in the Hessian's frame
+        masses: N atomic masses (amu), the ones the Hessian was weighted with
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: eigenvalues in ascending order (mode 1
+        the lowest, e.g. a transition-state mode) and the normalized
+        mass-weighted eigenvectors, one per row (n_modes x 3N)
+
+    Raises:
+        ValueError: when the Hessian, coordinates and masses do not fit
+    """
+    hessian = np.asarray(hessian, dtype=float)
+    coords = np.asarray(coords, dtype=float)
+    masses = np.asarray(masses, dtype=float)
+    n_atoms = len(masses)
+    if hessian.shape != (3 * n_atoms, 3 * n_atoms) or coords.shape != (n_atoms, 3):
+        raise ValueError("a Hessian of shape {} does not fit {} atoms".format(hessian.shape, n_atoms))
+    sqrt_m = np.repeat(np.sqrt(masses), 3)
+    relative = coords - (coords * masses[:, None]).sum(axis=0) / masses.sum()
+    rigid = []
+    for axis in np.eye(3):
+        rigid.append(np.tile(axis, n_atoms) * sqrt_m)                  # translation
+        rigid.append(np.cross(axis, relative).ravel() * sqrt_m)       # rotation
+    basis, singular, _ = np.linalg.svd(np.array(rigid).T, full_matrices=True)
+    rank = int((singular > singular.max() * 1e-8).sum())               # 5 if linear
+    internal = basis[:, rank:]                                        # vibrations only
+    symmetric = (hessian + hessian.T) / 2.0
+    eigenvalues, vectors = np.linalg.eigh(internal.T.dot(symmetric).dot(internal))
+    return eigenvalues, internal.dot(vectors).T
+
+
+def kabsch_rotation(moving, target) -> np.ndarray:
+    """The proper rotation R that best superimposes two geometries of the same
+    atoms after centering both: target - mean ~ (moving - mean) R.
+
+    Args:
+        moving: N x 3 coordinates to rotate
+        target: N x 3 coordinates to rotate onto
+
+    Returns:
+        np.ndarray: 3 x 3 rotation matrix (determinant +1)
+    """
+    a = np.asarray(moving, dtype=float)
+    b = np.asarray(target, dtype=float)
+    u, _, vt = np.linalg.svd((a - a.mean(axis=0)).T.dot(b - b.mean(axis=0)))
+    reflection = 1.0 if np.linalg.det(u.dot(vt)) >= 0 else -1.0
+    return u.dot(np.diag([1.0, 1.0, reflection])).dot(vt)
+
+
+def rotate_hessian(hessian: np.ndarray, rotation: np.ndarray) -> np.ndarray:
+    """A 3N x 3N Hessian expressed in the frame that `rotation` (from
+    kabsch_rotation) maps its coordinates into: every 3 x 3 atom block H_ij
+    becomes R^T H_ij R. Mass weighting is unaffected.
+
+    Args:
+        hessian (np.ndarray): 3N x 3N Hessian in the original frame
+        rotation (np.ndarray): 3 x 3 rotation, new = old R
+
+    Returns:
+        np.ndarray: the Hessian in the new frame
+    """
+    blocks = np.kron(np.eye(np.asarray(hessian).shape[0] // 3), rotation)
+    return blocks.T.dot(hessian).dot(blocks)
+
 # endregion Hessian-specific

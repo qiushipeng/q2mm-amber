@@ -31,8 +31,15 @@ Hessian fitting pairs -gh with -ah element by element; eigenmode fitting
 pairs -geigz with -ageig, comparing the force field's curvature along each
 QM normal mode (and the coupling between modes) with the QM eigenvalues.
 Both need the Gaussian job and the mol2 in the same Cartesian frame with the
-same atom order (run Gaussian with nosymm); eigenmode fitting also wants
-freq=hpmodes, since the modes are read from the printed normal coordinates.
+same atom order (run Gaussian with nosymm).
+
+--modes chooses where -geigz / -ageig take the QM normal modes from:
+"printed" (default) reads the frequency section of the log, which wants
+freq=hpmodes and, without nosymm, is in Gaussian's rotated standard
+orientation; "archive" diagonalizes the archive Hessian (the one -gh reads),
+at full precision and in its input frame. Give the same --modes on the RDAT
+and CDAT lines. -ageig stops when the modes and the mol2 are in different
+frames, unless --allow-frame-mismatch is given.
 
 Anything else from the old code (MacroModel / Jaguar / Tinker) is
 parsed but ignored.
@@ -115,6 +122,14 @@ def return_calculate_parser(add_help=True, parents=None):
     g.add_argument("--ffpath", "-f", type=str, default=None)
     g.add_argument("--invert", "-i", type=float, default=None,
                    help="Invert smallest Hessian eigenvalue to this value.")
+    g.add_argument("--modes", choices=MODE_SOURCES, default="printed",
+                   help="Where -geigz / -ageig take the QM normal modes from: "
+                        "'printed' (the log's frequency section; default) or "
+                        "'archive' (diagonalize the archive Hessian). Use the "
+                        "same value on the RDAT and CDAT lines.")
+    g.add_argument("--allow-frame-mismatch", action="store_true",
+                   help="Let -ageig run, with a warning, when the normal modes "
+                        "and the mol2 are in different frames (default: stop).")
     g.add_argument("--norun", "-n", action="store_true",
                    help="Don't actually run AMBER / leap; just read.")
     g.add_argument("--fake", action="store_true",
@@ -183,30 +198,87 @@ def _sibling(path, extension):
 FRAME_TOLERANCE = 0.01   # Angstrom, after removing the centroid
 # max |V V^T - I| above which the printed normal modes are too coarse to use
 MODE_ORTHONORMALITY_TOLERANCE = 0.01
+# where -geigz / -ageig take the QM normal modes from (--modes)
+MODE_SOURCES = ("printed", "archive")
 
 
-def _warn_if_frames_differ(log_atoms, mol2_path, label):
-    """Warn when the geometry in a Gaussian log and the mol2 do not coincide."""
+def _coordinates(atoms):
+    """N x 3 array of the x, y, z of Atom objects."""
+    return np.array([[a.x, a.y, a.z] for a in atoms], dtype=float)
+
+
+def _centered_deviation(a, b):
+    """Largest coordinate difference between two geometries after centering."""
+    return float(np.abs((a - a.mean(axis=0)) - (b - b.mean(axis=0))).max())
+
+
+def _frame_deviation(log_atoms, mol2_path, label):
+    """Largest coordinate difference (A) between a Gaussian geometry and the
+    mol2 after centering both, or None when it cannot be measured: no geometry,
+    no or unreadable mol2, or different atom counts (the last one warned)."""
     if not log_atoms or not mol2_path or not os.path.isfile(mol2_path):
-        return
+        return None
     try:
-        mol2_atoms = utilities.Mol2(mol2_path).structures[0].atoms
-        a = np.array([[x.x, x.y, x.z] for x in log_atoms], dtype=float)
-        b = np.array([[x.x, x.y, x.z] for x in mol2_atoms], dtype=float)
+        a = _coordinates(log_atoms)
+        b = _coordinates(utilities.Mol2(mol2_path).structures[0].atoms)
     except Exception as e:
         logger.debug("Frame check skipped for {}: {}".format(label, e))
-        return
+        return None
     if a.shape != b.shape:
         logger.warning("{}: {} atoms in the Gaussian log but {} in {}; the data "
                        "cannot be compared element by element.".format(
                            label, len(a), len(b), mol2_path))
-        return
-    deviation = float(np.abs((a - a.mean(axis=0)) - (b - b.mean(axis=0))).max())
-    if deviation > FRAME_TOLERANCE:
+        return None
+    return _centered_deviation(a, b)
+
+
+def _warn_if_frames_differ(log_atoms, mol2_path, label):
+    """Warn when the geometry in a Gaussian log and the mol2 do not coincide."""
+    deviation = _frame_deviation(log_atoms, mol2_path, label)
+    if deviation is not None and deviation > FRAME_TOLERANCE:
         logger.warning("{}: the geometry in the Gaussian log and {} differ by up to "
                        "{:.3f} A after centering, so the Hessian / normal-mode frames "
                        "do not match (run Gaussian with nosymm and build the mol2 "
                        "from the same coordinates).".format(label, mol2_path, deviation))
+
+
+def _check_mode_frame(log_atoms, mol2_path, label, geometry, hint, allow_mismatch=False):
+    """The -ageig frame check: the normal modes (whose frame is that of
+    `geometry`, a description of log_atoms) and the force-field Hessian built
+    from the mol2 must share one frame, or V H V^T tests every mode with the
+    wrong motion. Stops the run unless allow_mismatch, then only warns.
+    Returns the deviation (A), or None when it could not be measured."""
+    deviation = _frame_deviation(log_atoms, mol2_path, label)
+    if deviation is None or deviation <= FRAME_TOLERANCE:
+        return deviation
+    message = ("{}: {} and {} differ by up to {:.3f} A after centering, so the normal-mode "
+               "and Hessian frames do not match and the eigenmode fit would be meaningless. "
+               "{}".format(label, geometry, mol2_path, deviation, hint))
+    if allow_mismatch:
+        logger.warning(message + " Continuing because of --allow-frame-mismatch.")
+        return deviation
+    raise ValueError(message + " (--allow-frame-mismatch runs it anyway.)")
+
+
+# The -geigz eigenvalues and the -ageig modes of one log must come from the
+# same --modes source, or the fit compares the eigenvalues of one set of modes
+# with the curvature along another. loop.py runs RDAT (-geigz) and CDAT
+# (-ageig) as separate calls, so -geigz records its source for each log here
+# and -ageig checks it -- a module global, like co.FIXED_ATOMS.
+_REFERENCE_MODE_SOURCE = {}
+
+
+def _record_mode_source(log_path, modes):
+    _REFERENCE_MODE_SOURCE[os.path.abspath(log_path)] = modes
+
+
+def _check_mode_source(log_path, modes):
+    recorded = _REFERENCE_MODE_SOURCE.get(os.path.abspath(log_path))
+    if recorded is not None and recorded != modes:
+        raise ValueError(
+            "-ageig {0} uses --modes {1}, but -geigz read {0} with --modes {2}; give the "
+            "same --modes on the RDAT and CDAT lines.".format(
+                os.path.basename(log_path), modes, recorded))
 
 
 # ---------------------------------------------------------------------------
@@ -252,54 +324,203 @@ def _gauss_log_hessian(path, invert=None):
     return datums_from_hessian(H, os.path.basename(path))
 
 
-def _gauss_log_eigenmatrix(path, invert=None):
+def _wavenumber(eigenvalues):
+    """Mass-weighted Hessian eigenvalues (kJ/mol/A^2/amu) as signed cm^-1."""
+    eigenvalues = np.asarray(eigenvalues, dtype=float)
+    return np.sign(eigenvalues) * co.EIGENVALUE_CONVERSION * np.sqrt(np.abs(eigenvalues))
+
+
+def _archive_hessian(path):
+    """The mass-weighted archive Hessian (kJ/mol/A^2/amu) of a Gaussian
+    frequency log and the archive's atoms, whose geometry is its input
+    orientation. Raises ValueError when the log has no archive Hessian."""
+    log = utilities.GaussLog(path)
+    try:
+        log.read_archive()
+    except Exception as e:
+        raise ValueError("cannot read the archive of {}: {}".format(path, e))
+    if not log.structures or log.structures[0].hess is None:
+        raise ValueError("no Hessian in the archive of {}".format(path))
+    struct = log.structures[0]
+    hessian = struct.hess.copy()
+    utilities.mass_weight_hessian(hessian, struct.atoms)
+    return hessian, [a for a in struct.atoms if not a.is_dummy]
+
+
+def _archive_modes(path):
+    """Eigenvalues (kJ/mol/A^2/amu, ascending) and normal modes (one per row)
+    of the archive Hessian of a Gaussian frequency log -- rigid-body motion
+    projected out and the rest diagonalized, as Gaussian does for the modes
+    it prints -- and the archive's atoms, whose geometry fixes their frame."""
+    hessian, atoms = _archive_hessian(path)
+    masses = [co.MASSES[a.element] for a in atoms]
+    evals, evecs = math_util.vibrational_modes(hessian, _coordinates(atoms), masses)
+    return evals, evecs, atoms
+
+
+def _gauss_log_eigenmatrix(path, invert=None, modes="printed"):
     """
     The reference eigenmatrix: the eigenvalues of the mass-weighted QM
-    Hessian, read from the frequency section of the Gaussian log (force
-    constant over reduced mass, per mode) in kJ/mol/A^2/amu, on the diagonal
-    of an otherwise zero matrix, emitted as Datum (typ='eig'). Mode 1 is the
-    lowest, the transition-state mode; with `invert` its (negative)
-    eigenvalue is replaced by that value. Matches upstream q2mm's -geigz.
+    Hessian in kJ/mol/A^2/amu on the diagonal of an otherwise zero matrix,
+    emitted as Datum (typ='eig'). With modes="printed" they are read from the
+    frequency section of the Gaussian log (force constant over reduced mass,
+    per mode), as upstream q2mm's -geigz does; with modes="archive" they come
+    from diagonalizing the archive Hessian. Mode 1 is the lowest, the
+    transition-state mode; with `invert` its (negative) eigenvalue is
+    replaced by that value. The source is recorded for the -ageig check.
     """
-    log = utilities.GaussLog(path)
-    evals = np.asarray(log.evals, dtype=float)
-    if evals.size == 0:
-        logger.warning("No normal modes in the Gaussian log: {}".format(path))
-        return []
-    evals = evals * co.HESSIAN_CONVERSION
+    _record_mode_source(path, modes)
+    if modes == "archive":
+        evals = _archive_modes(path)[0]
+    else:
+        evals = np.asarray(utilities.GaussLog(path).evals, dtype=float)
+        if evals.size == 0:
+            logger.warning("No normal modes in the Gaussian log: {}".format(path))
+            return []
+        evals = evals * co.HESSIAN_CONVERSION
     if invert is not None:
         evals = math_util.replace_lowest_eigenvalue(evals, invert, label=path)
     return datums_from_eigenmatrix(np.diag(evals), os.path.basename(path))
 
 
-def reference_modes(log_path, mol2_path=None):
+def reference_modes(log_path, mol2_path=None, modes="printed", allow_frame_mismatch=False):
     """
-    The normalized, mass-weighted QM eigenvectors from the frequency section
-    of a Gaussian log (n_modes x 3N), for projecting the calculated Hessian
-    (-ageig). Warns when the log's geometry and the mol2 are not in the same
-    frame. Use freq=hpmodes: the low-precision normal coordinates are only
-    orthonormal to a few percent.
+    The normalized, mass-weighted QM normal modes (n_modes x 3N) for
+    projecting the calculated Hessian (-ageig), from the source --modes names:
+
+    * "printed": the frequency section of the log. Without nosymm Gaussian
+      prints them in its rotated standard orientation, and without
+      freq=hpmodes to two decimals; both are warned about.
+    * "archive": the archive Hessian diagonalized, at full precision and in
+      the archive's (input) frame.
+
+    The mol2 must be in the modes' frame; a mismatch stops the run, or only
+    warns with allow_frame_mismatch. A self-check logs how well the chosen
+    modes diagonalize the QM Hessian itself.
     """
+    label = "-ageig " + os.path.basename(log_path)
+    _check_mode_source(log_path, modes)
+    if modes == "archive":
+        evals, evecs, atoms = _archive_modes(log_path)
+        _check_mode_frame(atoms, mol2_path, label, "the archive geometry of the log",
+                          "Build the mol2 from the archive geometry, the frame of the "
+                          "-gh Hessian.", allow_frame_mismatch)
+        _compare_with_printed_modes(log_path, evals, label)
+        return evecs
+    return _printed_modes(log_path, mol2_path, label, allow_frame_mismatch)
+
+
+def _printed_modes(log_path, mol2_path, label, allow_frame_mismatch):
+    """reference_modes for --modes printed: the modes, the precision and
+    nosymm warnings, the frame check and the self-check."""
     log = utilities.GaussLog(log_path)
     evecs = np.asarray(log.evecs, dtype=float)
     if evecs.size == 0:
         raise ValueError("No normal modes in the Gaussian log: {}".format(log_path))
-    label = "-ageig " + os.path.basename(log_path)
     # Low-precision normal coordinates (no freq=hpmodes: two decimals) give
     # eigenvectors that are only roughly orthonormal, and that error goes
     # straight into every element of the projected Hessian.
     error = float(np.abs(evecs.dot(evecs.T) - np.eye(len(evecs))).max())
     if error > MODE_ORTHONORMALITY_TOLERANCE:
-        logger.warning("{}: the normal modes are orthonormal only to {:.1%}; rerun the "
-                       "frequency job with freq=hpmodes so the eigenvectors are printed "
-                       "at full precision.".format(label, error))
+        logger.warning("{}: the normal modes were printed {}and are orthonormal only to "
+                       "{:.1%}; rerun the frequency job with freq=hpmodes so the eigenvectors "
+                       "are printed at full precision, or use --modes archive.".format(
+                           label, "" if log.printed_hpmodes() else "without freq=hpmodes ",
+                           error))
     try:
-        log_atoms = log.last_orientation()
+        printed = log.last_orientation()    # the frame the modes are printed in
     except Exception as e:   # the check must never take a run down
         logger.debug("Frame check skipped for {}: {}".format(label, e))
-        log_atoms = []
-    _warn_if_frames_differ(log_atoms, mol2_path, label)
+        printed = []
+    try:
+        archive_hessian, archive_atoms = _archive_hessian(log_path)
+    except ValueError as e:
+        logger.debug("{}: no archive Hessian to check against: {}".format(label, e))
+        archive_hessian, archive_atoms = None, []
+    comparable = bool(printed) and len(archive_atoms) == len(printed)
+    # Without nosymm Gaussian prints the modes in its standard orientation,
+    # rotated from the input orientation of the archive (and so of -gh).
+    if comparable:
+        rotated = _centered_deviation(_coordinates(archive_atoms),
+                                      _coordinates(printed)) > FRAME_TOLERANCE
+    else:
+        rotated = not log.used_nosymm()
+    if rotated:
+        hint = ("The frequency job ran without nosymm, so Gaussian printed the normal modes "
+                "in its rotated standard orientation, not in the input orientation of the "
+                "archive (or of a mol2 built from it). Rerun the frequency job with nosymm "
+                "freq=hpmodes, build the mol2 in the log's standard orientation, or use "
+                "--modes archive.")
+    else:
+        hint = "Build the mol2 from the geometry the frequency job printed."
+    deviation = _check_mode_frame(printed, mol2_path, label,
+                                  "the geometry the log prints its normal modes in",
+                                  hint, allow_frame_mismatch)
+    if rotated and deviation is not None and deviation <= FRAME_TOLERANCE:
+        logger.warning("{}: the frequency job ran without nosymm. {} matches the standard "
+                       "orientation of the printed normal modes, but the archive Hessian "
+                       "that -gh reads is in the input orientation, so this mol2 cannot "
+                       "serve -gh as well; rerun the frequency job with nosymm, or use "
+                       "--modes archive, to keep one frame.".format(
+                           label, os.path.basename(mol2_path)))
+    if comparable and archive_hessian is not None:
+        rotation = math_util.kabsch_rotation(_coordinates(archive_atoms), _coordinates(printed))
+        _self_check_modes(math_util.rotate_hessian(archive_hessian, rotation), evecs,
+                          np.asarray(log.evals, dtype=float) * co.HESSIAN_CONVERSION, label)
     return evecs
+
+
+def _self_check_modes(qm_hessian, evecs, evals, label):
+    """Log how well the chosen modes diagonalize the QM Hessian they belong to
+    (given in their frame). Exact modes give diag(evals); the score logged is
+    what a force field reproducing the QM Hessian exactly would get on the
+    eigenmode data -- the floor these modes put under the fit. Returns
+    (largest frequency error in cm^-1, RMS coupling, floor), or None when the
+    check cannot be made."""
+    try:
+        matrix = math_util.project_hessian(qm_hessian, evecs)
+    except ValueError as e:
+        logger.debug("{}: self-check skipped: {}".format(label, e))
+        return None
+    if len(evals) != len(matrix):
+        logger.debug("{}: self-check skipped: {} eigenvalues for {} modes".format(
+            label, len(evals), len(matrix)))
+        return None
+    diagonal = np.diag(matrix)
+    coupling = (matrix - np.diag(diagonal))[np.tril_indices_from(matrix, -1)]
+    worst = float(np.abs(_wavenumber(diagonal) - _wavenumber(evals)).max())
+    rms_coupling = float(np.sqrt(np.mean(coupling ** 2))) if coupling.size else 0.0
+    reference = datums_from_eigenmatrix(np.diag(evals), "selfcheck")
+    score.import_weights(reference)
+    floor = float(score.score_data(reference, datums_from_eigenmatrix(matrix, "selfcheck")))
+    logger.log(20, "{}: self-check, the QM Hessian projected on these modes: largest "
+               "frequency error {:.1f} cm^-1, RMS coupling {:.2f} kJ/mol/A^2/amu; a force "
+               "field reproducing it exactly would score {:.4f} on the eigenmode data "
+               "(0 for exact modes).".format(label, worst, rms_coupling, floor))
+    return worst, rms_coupling, floor
+
+
+def _compare_with_printed_modes(log_path, evals, label):
+    """Log how the archive modes' frequencies compare with the ones Gaussian
+    printed; sound logs agree up to masses and rounding. Returns the largest
+    difference in cm^-1, or None when the log printed no comparable modes."""
+    try:
+        printed = np.asarray(utilities.GaussLog(log_path).evals, dtype=float) * co.HESSIAN_CONVERSION
+    except Exception as e:   # the comparison must never take a run down
+        logger.debug("{}: no printed frequencies to compare with: {}".format(label, e))
+        return None
+    if printed.size == 0:
+        return None
+    if printed.size != evals.size:
+        logger.warning("{}: {} normal modes from the archive Hessian but {} printed in the "
+                       "log.".format(label, evals.size, printed.size))
+        return None
+    difference = float(np.abs(_wavenumber(evals) - _wavenumber(printed)).max())
+    logger.log(20, "{}: {} normal modes from the archive Hessian; their frequencies match the "
+               "printed ones to {:.1f} cm^-1 (mode 1: {:.1f} here, {:.1f} printed).".format(
+                   label, evals.size, difference,
+                   float(_wavenumber(evals[0])), float(_wavenumber(printed[0]))))
+    return difference
 
 
 def _gauss_log_energy(path, typ="e", group_idx=1):
@@ -326,7 +547,8 @@ def _gauss_log_energy(path, typ="e", group_idx=1):
 # (command flag, datum type, collector function)
 _GAUSSIAN_DISPATCH = [
     ("gh",    "h",   lambda p, opts: _gauss_log_hessian(p, invert=opts.invert)),
-    ("geigz", "eig", lambda p, opts: _gauss_log_eigenmatrix(p, invert=opts.invert)),
+    ("geigz", "eig", lambda p, opts: _gauss_log_eigenmatrix(
+        p, invert=opts.invert, modes=getattr(opts, "modes", "printed"))),
     ("ge",   "e",   lambda p, opts: _gauss_log_energy(p, typ="e")),
     ("ge1",  "e1",  lambda p, opts: _gauss_log_energy(p, typ="e1")),
     ("geo",  "eo",  lambda p, opts: _gauss_log_energy(p, typ="eo")),
@@ -374,12 +596,19 @@ def build_calculators(opts, ff=None, runner=None):
         for filename in _flag_files(opts, flag):
             reference.setdefault(_full_path(opts, filename), []).append(command)
 
+    modes = getattr(opts, "modes", "printed")
+    # A -geigz in this same call is read after the calculators are built
+    # (collect_data), so record its source now for the -ageig check.
+    for filename in _flag_files(opts, "geigz"):
+        _record_mode_source(_full_path(opts, filename), modes)
     calcs = []
     for key, commands in calculated.items():
         in_path = key[0]
         eigenvectors = None
         if key in mode_logs:
-            eigenvectors = reference_modes(mode_logs[key], _mol2_of(in_path))
+            eigenvectors = reference_modes(
+                mode_logs[key], _mol2_of(in_path), modes=modes,
+                allow_frame_mismatch=getattr(opts, "allow_frame_mismatch", False))
         calcs.append(calculators.AmberCalculator(
             os.path.dirname(in_path), os.path.basename(in_path), commands,
             ff=ff, invert=opts.invert, runner=runner, eigenvectors=eigenvectors))

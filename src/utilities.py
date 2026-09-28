@@ -427,7 +427,9 @@ class GaussLog(File):
     Retrieves data from Gaussian log files.
 
     If you are extracting frequencies/Hessian data from this file, use
-    the keyword NoSymmetry when running the Gaussian calculation.
+    the keyword NoSymmetry when running the Gaussian calculation, and
+    freq=hpmodes when the printed normal modes are used (-ageig).
+    used_nosymm() and printed_hpmodes() report what a log was run with.
     """
 
     __slots__ = [
@@ -534,6 +536,61 @@ class GaussLog(File):
             if block:
                 atoms = block
         return atoms
+
+    # nosymm, NoSymmetry, Symmetry=None, Symm(None) -- case-insensitive
+    NOSYMM_KEYWORD = re.compile(r"nosymm|symm(?:etry)?\s*[=(]\s*\(?\s*none", re.IGNORECASE)
+
+    def route_sections(self) -> List[str]:
+        """The route section ("#p freq ...") of every job step in the log, in
+        order, continuation lines joined. An opt+freq job has two: the one given
+        and the frequency step Gaussian generates. Lines are joined without a
+        separator because Gaussian wraps the route at a fixed width, which can
+        split a keyword.
+
+        Returns:
+            List[str]: one string per route section
+        """
+        routes = []
+        lines = iter(self.lines)
+        for line in lines:
+            text = line.strip()
+            if not text.startswith("#"):
+                continue
+            route = [text]
+            for row in lines:
+                row = row.strip()
+                if not row or row.startswith("---") or row.endswith(":"):
+                    break
+                route.append(row)
+            routes.append("".join(route))
+        return routes
+
+    def used_nosymm(self) -> bool:
+        """Whether the job kept its input orientation: nosymm (or
+        symmetry=none) in a route section, or only "Input orientation:" tables
+        printed. Without it Gaussian prints its normal modes in a rotated
+        "standard orientation", while the archive geometry and Hessian stay in
+        the input orientation.
+
+        Returns:
+            bool: True when the input orientation was kept
+        """
+        if any(self.NOSYMM_KEYWORD.search(route) for route in self.route_sections()):
+            return True
+        text = "".join(self.lines)
+        return "Input orientation:" in text and "Standard orientation:" not in text
+
+    def printed_hpmodes(self) -> bool:
+        """Whether the normal modes were printed at high precision
+        (freq=hpmodes: the "Coord Atom Element:" layout, five decimals) rather
+        than in the default two-decimal layout.
+
+        Returns:
+            bool: True for high-precision normal modes
+        """
+        if any("hpmodes" in route.lower() for route in self.route_sections()):
+            return True
+        return any("Coord Atom Element:" in line for line in self.lines)
 
     @property
     def esp_rms(self):

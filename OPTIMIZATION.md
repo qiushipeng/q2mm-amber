@@ -299,13 +299,65 @@ CDAT -ah MOL.in -ageig MOL.in,MOL.log
 
 Two requirements matter especially here:
 
-* run the Gaussian frequency job with **`nosymm`** and **`freq=hpmodes`**.
-  The eigenvectors are read from the printed normal coordinates: without
-  `hpmodes` they carry two decimals and are orthonormal only to a few percent,
-  and without `nosymm` they can be in a rotated frame.
+* with the default `--modes printed` (below), run the Gaussian frequency job
+  with **`nosymm`** and **`freq=hpmodes`**. The eigenvectors are then read
+  from the printed normal coordinates: without `hpmodes` they carry two
+  decimals and are orthonormal only to a few percent, and without `nosymm`
+  Gaussian prints them in its rotated *standard orientation*, while the
+  archive geometry and Hessian (what `-gh` reads) stay in the input
+  orientation.
 * the log and the mol2 must hold the same atoms, in the same order and the
-  same Cartesian frame (true for `-gh` as well). q2mm-amber compares the two
-  geometries and warns when they differ by more than 0.01 Å after centering.
+  same Cartesian frame (true for `-gh` as well).
+
+### `--modes` — where the normal modes come from
+
+| `--modes` | `-geigz` eigenvalues and `-ageig` modes come from | precision | the mol2 must be in |
+|---|---|---|---|
+| `printed` (default) | the log's frequency section (`Frequencies --`, force constants, normal coordinates), as upstream Q2MM | 5 decimals with `hpmodes`, 2 without | the frame of the log's last orientation table: the input orientation with `nosymm`, the standard orientation without |
+| `archive` | the archive Hessian (the one `-gh` reads), diagonalized after projecting out rigid translation and rotation, as Gaussian does for the modes it prints | full | the archive geometry (input orientation), the same frame as for `-gh` |
+
+Give the same value on the `RDAT` and `CDAT` lines; `-ageig` stops when it
+differs from what `-geigz` used for that log:
+
+```
+RDAT -geigz MOL.log -i 1 --modes archive
+CDAT -ageig MOL.in,MOL.log --modes archive
+```
+
+`archive` works with any frequency log that has an archive entry, including
+jobs run without `nosymm` / `hpmodes`, and keeps `-gh` and `-ageig` in one
+frame, so they can share a mol2. For a sound log the two sources agree to
+rounding: on a 97-atom ωB97X-D/def2-SVP transition state the archive modes
+reproduce the printed frequencies to 0.4 cm⁻¹ (TS mode 637.1i both ways).
+
+### What `-ageig` checks and reports
+
+* **Frame — stops the run.** The mol2 is compared with the geometry that
+  sets the modes' frame (the log's last orientation table for `printed`, the
+  archive geometry for `archive`). Above 0.01 Å after centering every mode
+  would be tested with the wrong motion, so `CDAT` stops with an error naming
+  the likely cause and the fixes. `--allow-frame-mismatch` turns the error
+  into a warning.
+* **`nosymm` — warning** (`printed`). The printed frame and the archive frame
+  differ, i.e. the job ran without `nosymm`. If the mol2 matches the printed
+  standard orientation the eigenmode fit is sound, but that mol2 cannot also
+  serve `-gh`, which needs the input orientation.
+* **`hpmodes` — warning** (`printed`). The modes are orthonormal only to more
+  than 1%, as two-decimal modes without `freq=hpmodes` are.
+* **Self-check — info line.** With `printed`, the archive QM Hessian is
+  rotated into the modes' frame and projected onto them; the line gives the
+  largest frequency error, the RMS coupling, and the score a force field
+  reproducing the QM Hessian *exactly* would get — the floor the modes put
+  under the fit (0 for exact modes). With `archive`, the line compares the
+  modes' frequencies with the printed ones.
+
+For the 97-atom log above, run without `nosymm` / `hpmodes`:
+
+| setup | outcome |
+|---|---|
+| `printed`, mol2 in the archive frame | stops: "differ by up to 14.795 A … The frequency job ran without nosymm …" |
+| `printed`, mol2 in the standard orientation | runs, with the `hpmodes` (3.2%) and `nosymm` warnings; self-check floor 0.082 |
+| `archive`, mol2 in the archive frame | runs, no warnings; start score 6.13 against 6.24 for the row above |
 
 ### `FXATM` — fixed atoms
 
@@ -711,3 +763,5 @@ terms.
 | `HYBR` used fewer workers than requested | `n_processes` is silently capped at `pop_size` and at the available cores. Speed only; results are unaffected. |
 | two runs give different answers | expected — `HYBR` is stochastic with no fixed seed. |
 | `HYBR: unrecognised option(s)` | options are `--name value` pairs (`--max_iter 200`); the old `name=value` form and `precision` are gone — the `LOOP` convergence is the precision now. |
+| `-ageig …: … differ by up to … the normal-mode and Hessian frames do not match` | the mol2 is not in the frame of the normal modes. Usually the frequency job ran without `nosymm` and the mol2 was built from the archive geometry: use `--modes archive` on both lines, build the mol2 in the log's standard orientation, or rerun the frequency job with `nosymm freq=hpmodes` (§4, `--modes`). |
+| `-ageig … uses --modes …, but -geigz read … with --modes …` | the `RDAT` and `CDAT` lines ask for different mode sources; give both the same `--modes`. |
