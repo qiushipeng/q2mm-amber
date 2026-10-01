@@ -306,8 +306,11 @@ Two requirements matter especially here:
   Gaussian prints them in its rotated *standard orientation*, while the
   archive geometry and Hessian (what `-gh` reads) stay in the input
   orientation.
-* the log and the mol2 must hold the same atoms, in the same order and the
-  same Cartesian frame (true for `-gh` as well).
+* the log and the structure — the mol2 the leap input loads **and** the
+  `MOL.pdb` nab computes the Hessian at — must hold the same atoms, in the
+  same order and the same Cartesian frame (true for `-gh` / `-ah` as well).
+  An existing `MOL.pdb` is used as it is (it is built from the mol2 only
+  while missing), so delete it whenever you replace the mol2.
 
 ### `--modes` — where the normal modes come from
 
@@ -330,10 +333,20 @@ frame, so they can share a mol2. For a sound log the two sources agree to
 rounding: on a 97-atom ωB97X-D/def2-SVP transition state the archive modes
 reproduce the printed frequencies to 0.4 cm⁻¹ (TS mode 637.1i both ways).
 
+### What `-ah` checks
+
+* **Frame — stops the run.** `CDAT` compares the mol2 and the pdb nab reads
+  with the archive geometry of the `-gh` log they are scored against: the
+  Hessian data are paired by position, so the k-th `-ah` input goes with the
+  k-th log on the `RDAT -gh` line, whatever the log is called. Above 0.01 Å
+  after centering every Hessian element would be compared with the wrong
+  motion, so `CDAT` stops with an error naming the file.
+  `--allow-frame-mismatch` on the `CDAT` line turns the error into a warning.
+
 ### What `-ageig` checks and reports
 
-* **Frame — stops the run.** The mol2 is compared with the geometry that
-  sets the modes' frame (the log's last orientation table for `printed`, the
+* **Frame — stops the run.** The mol2 and the pdb nab reads are compared
+  with the geometry that sets the modes' frame (the log's last orientation table for `printed`, the
   archive geometry for `archive`). Above 0.01 Å after centering every mode
   would be tested with the wrong motion, so `CDAT` stops with an error naming
   the likely cause and the fixes. `--allow-frame-mismatch` turns the error
@@ -763,5 +776,6 @@ terms.
 | `HYBR` used fewer workers than requested | `n_processes` is silently capped at `pop_size` and at the available cores. Speed only; results are unaffected. |
 | two runs give different answers | expected — `HYBR` is stochastic with no fixed seed. |
 | `HYBR: unrecognised option(s)` | options are `--name value` pairs (`--max_iter 200`); the old `name=value` form and `precision` are gone — the `LOOP` convergence is the precision now. |
-| `-ageig …: … differ by up to … the normal-mode and Hessian frames do not match` | the mol2 is not in the frame of the normal modes. Usually the frequency job ran without `nosymm` and the mol2 was built from the archive geometry: use `--modes archive` on both lines, build the mol2 in the log's standard orientation, or rerun the frequency job with `nosymm freq=hpmodes` (§4, `--modes`). |
+| `-ah …: the archive geometry of … and … differ by up to … the QM and force-field frames do not match` | the mol2 or pdb is not in the frame of the `-gh` log — typically one left over from an earlier frequency job whose input orientation differs. Build the mol2 from that log's archive geometry and delete the old pdb, which is only rebuilt while missing (§4). |
+| `-ageig …: … differ by up to … the QM and force-field frames do not match` | the mol2 or pdb is not in the frame of the normal modes. Usually the frequency job ran without `nosymm` and the mol2 was built from the archive geometry: use `--modes archive` on both lines, build the mol2 in the log's standard orientation, or rerun the frequency job with `nosymm freq=hpmodes` (§4, `--modes`). A pdb left over from an older mol2 also triggers it: delete it. |
 | `-ageig … uses --modes …, but -geigz read … with --modes …` | the `RDAT` and `CDAT` lines ask for different mode sources; give both the same `--modes`. |

@@ -30,16 +30,18 @@ Gaussian: -gh (Hessian), -geigz (eigenmatrix: the QM eigenvalues on the
 Hessian fitting pairs -gh with -ah element by element; eigenmode fitting
 pairs -geigz with -ageig, comparing the force field's curvature along each
 QM normal mode (and the coupling between modes) with the QM eigenvalues.
-Both need the Gaussian job and the mol2 in the same Cartesian frame with the
-same atom order (run Gaussian with nosymm).
+Both need the Gaussian job and the structure -- the mol2 the leap input
+loads and the pdb nab computes the Hessian at -- in the same Cartesian frame
+with the same atom order (run Gaussian with nosymm). -ah stops when either is
+in another frame than its -gh log, and -ageig when either is in another
+frame than the normal modes, unless --allow-frame-mismatch is given.
 
 --modes chooses where -geigz / -ageig take the QM normal modes from:
 "printed" (default) reads the frequency section of the log, which wants
 freq=hpmodes and, without nosymm, is in Gaussian's rotated standard
 orientation; "archive" diagonalizes the archive Hessian (the one -gh reads),
 at full precision and in its input frame. Give the same --modes on the RDAT
-and CDAT lines. -ageig stops when the modes and the mol2 are in different
-frames, unless --allow-frame-mismatch is given.
+and CDAT lines.
 
 Anything else from the old code (MacroModel / Jaguar / Tinker) is
 parsed but ignored.
@@ -128,8 +130,9 @@ def return_calculate_parser(add_help=True, parents=None):
                         "'archive' (diagonalize the archive Hessian). Use the "
                         "same value on the RDAT and CDAT lines.")
     g.add_argument("--allow-frame-mismatch", action="store_true",
-                   help="Let -ageig run, with a warning, when the normal modes "
-                        "and the mol2 are in different frames (default: stop).")
+                   help="Let -ah / -ageig run, with a warning, when the mol2 or "
+                        "the pdb nab reads is in another frame than the -gh log / "
+                        "the normal modes (default: stop).")
     g.add_argument("--norun", "-n", action="store_true",
                    help="Don't actually run AMBER / leap; just read.")
     g.add_argument("--fake", action="store_true",
@@ -192,9 +195,10 @@ def _sibling(path, extension):
 
 
 # Reference and calculated Hessians (and normal modes) are compared element
-# by element, which only means something if the Gaussian job and the mol2 the
-# Amber topology is built from share one Cartesian frame and one atom order.
-# A rotated or reordered mol2 gives a finite, wrong fit with no other symptom.
+# by element, which only means something if the Gaussian job and the Amber
+# structure -- the mol2 the leap input loads and the pdb nab computes the
+# Hessian at -- share one Cartesian frame and one atom order. A rotated or
+# reordered structure gives a finite, wrong fit with no other symptom.
 FRAME_TOLERANCE = 0.01   # Angstrom, after removing the centroid
 # max |V V^T - I| above which the printed normal modes are too coarse to use
 MODE_ORTHONORMALITY_TOLERANCE = 0.01
@@ -212,48 +216,54 @@ def _centered_deviation(a, b):
     return float(np.abs((a - a.mean(axis=0)) - (b - b.mean(axis=0))).max())
 
 
-def _frame_deviation(log_atoms, mol2_path, label):
-    """Largest coordinate difference (A) between a Gaussian geometry and the
-    mol2 after centering both, or None when it cannot be measured: no geometry,
-    no or unreadable mol2, or different atom counts (the last one warned)."""
-    if not log_atoms or not mol2_path or not os.path.isfile(mol2_path):
+def _structure_coordinates(path):
+    """N x 3 coordinates of a mol2, or of the ATOM/HETATM records of a pdb."""
+    if path.endswith(".pdb"):
+        with open(path) as f:
+            rows = [[float(line[30:38]), float(line[38:46]), float(line[46:54])]
+                    for line in f if line.startswith(("ATOM", "HETATM"))]
+        return np.array(rows, dtype=float).reshape(-1, 3)
+    return _coordinates(utilities.Mol2(path).structures[0].atoms)
+
+
+def _frame_deviation(log_atoms, path, label):
+    """Largest coordinate difference (A) between a Gaussian geometry and a mol2
+    or pdb after centering both, or None when it cannot be measured: no
+    geometry, no or unreadable file, or different atom counts (the last one
+    warned)."""
+    if not log_atoms or not path or not os.path.isfile(path):
         return None
     try:
         a = _coordinates(log_atoms)
-        b = _coordinates(utilities.Mol2(mol2_path).structures[0].atoms)
+        b = _structure_coordinates(path)
     except Exception as e:
         logger.debug("Frame check skipped for {}: {}".format(label, e))
         return None
     if a.shape != b.shape:
         logger.warning("{}: {} atoms in the Gaussian log but {} in {}; the data "
                        "cannot be compared element by element.".format(
-                           label, len(a), len(b), mol2_path))
+                           label, len(a), len(b), path))
         return None
     return _centered_deviation(a, b)
 
 
-def _warn_if_frames_differ(log_atoms, mol2_path, label):
-    """Warn when the geometry in a Gaussian log and the mol2 do not coincide."""
-    deviation = _frame_deviation(log_atoms, mol2_path, label)
-    if deviation is not None and deviation > FRAME_TOLERANCE:
-        logger.warning("{}: the geometry in the Gaussian log and {} differ by up to "
-                       "{:.3f} A after centering, so the Hessian / normal-mode frames "
-                       "do not match (run Gaussian with nosymm and build the mol2 "
-                       "from the same coordinates).".format(label, mol2_path, deviation))
-
-
-def _check_mode_frame(log_atoms, mol2_path, label, geometry, hint, allow_mismatch=False):
-    """The -ageig frame check: the normal modes (whose frame is that of
+def _check_frame(log_atoms, path, label, geometry, hint, allow_mismatch=False):
+    """The frame check of -ah and -ageig: the QM data (whose frame is that of
     `geometry`, a description of log_atoms) and the force-field Hessian built
-    from the mol2 must share one frame, or V H V^T tests every mode with the
-    wrong motion. Stops the run unless allow_mismatch, then only warns.
-    Returns the deviation (A), or None when it could not be measured."""
-    deviation = _frame_deviation(log_atoms, mol2_path, label)
+    from `path`, a mol2 or pdb, must share one frame, or every Hessian element
+    (every mode of V H V^T) is compared with the wrong motion. Stops the run
+    unless allow_mismatch, then only warns. Returns the deviation (A), or None
+    when it could not be measured."""
+    deviation = _frame_deviation(log_atoms, path, label)
     if deviation is None or deviation <= FRAME_TOLERANCE:
         return deviation
-    message = ("{}: {} and {} differ by up to {:.3f} A after centering, so the normal-mode "
-               "and Hessian frames do not match and the eigenmode fit would be meaningless. "
-               "{}".format(label, geometry, mol2_path, deviation, hint))
+    if path.endswith(".pdb"):
+        hint += (" nab computes the Hessian at {}, which is built from the mol2 only "
+                 "while it is missing: delete it after replacing the mol2.".format(
+                     os.path.basename(path)))
+    message = ("{}: {} and {} differ by up to {:.3f} A after centering, so the QM and "
+               "force-field frames do not match and the fit would be meaningless. "
+               "{}".format(label, geometry, path, deviation, hint))
     if allow_mismatch:
         logger.warning(message + " Continuing because of --allow-frame-mismatch.")
         return deviation
@@ -279,6 +289,28 @@ def _check_mode_source(log_path, modes):
             "-ageig {0} uses --modes {1}, but -geigz read {0} with --modes {2}; give the "
             "same --modes on the RDAT and CDAT lines.".format(
                 os.path.basename(log_path), modes, recorded))
+
+
+# The frames of the -gh reference Hessians, in the order the logs were given.
+# score.compare_data pairs the Hessian data by position, so the k-th -ah leap
+# input is scored against the k-th -gh log, and its structure must be in that
+# log's archive frame. loop.py runs RDAT (-gh) and CDAT (-ah) as separate
+# calls, so the logs of the latest -gh call are recorded here for the -ah
+# check -- a module global, like _REFERENCE_MODE_SOURCE.
+_REFERENCE_HESSIAN_FRAMES = OrderedDict()
+
+
+def _record_hessian_frames(log_paths):
+    """Make the archive geometries of `log_paths`, the -gh logs of one call,
+    the reference frames, replacing those of an earlier call. A log without an
+    archive Hessian gets no frame (-gh warns about it)."""
+    _REFERENCE_HESSIAN_FRAMES.clear()
+    for path in log_paths:
+        try:
+            atoms = _archive_hessian(path)[1]
+        except ValueError:
+            atoms = None
+        _REFERENCE_HESSIAN_FRAMES[os.path.abspath(path)] = atoms
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +350,6 @@ def _gauss_log_hessian(path, invert=None):
     utilities.mass_weight_hessian(H, struct.atoms)
     if invert is not None:
         H = math_util.invert_lowest_eigenvalue(H, invert, label=path)
-    _warn_if_frames_differ(struct.atoms, _sibling(path, ".mol2"), "-gh " + os.path.basename(path))
     # One Datum per lower-tri element, tagged typ='h' so it picks up the
     # uniform Hessian weight (WEIGHTS['h']) at score time.
     return datums_from_hessian(H, os.path.basename(path))
@@ -383,7 +414,8 @@ def _gauss_log_eigenmatrix(path, invert=None, modes="printed"):
     return datums_from_eigenmatrix(np.diag(evals), os.path.basename(path))
 
 
-def reference_modes(log_path, mol2_path=None, modes="printed", allow_frame_mismatch=False):
+def reference_modes(log_path, mol2_path=None, modes="printed", allow_frame_mismatch=False,
+                    nab_path=None):
     """
     The normalized, mass-weighted QM normal modes (n_modes x 3N) for
     projecting the calculated Hessian (-ageig), from the source --modes names:
@@ -394,23 +426,25 @@ def reference_modes(log_path, mol2_path=None, modes="printed", allow_frame_misma
     * "archive": the archive Hessian diagonalized, at full precision and in
       the archive's (input) frame.
 
-    The mol2 must be in the modes' frame; a mismatch stops the run, or only
-    warns with allow_frame_mismatch. A self-check logs how well the chosen
-    modes diagonalize the QM Hessian itself.
+    The mol2, and nab_path (the pdb nab computes the Hessian at, when it is
+    another file), must be in the modes' frame; a mismatch stops the run, or
+    only warns with allow_frame_mismatch. A self-check logs how well the
+    chosen modes diagonalize the QM Hessian itself.
     """
     label = "-ageig " + os.path.basename(log_path)
     _check_mode_source(log_path, modes)
     if modes == "archive":
         evals, evecs, atoms = _archive_modes(log_path)
-        _check_mode_frame(atoms, mol2_path, label, "the archive geometry of the log",
-                          "Build the mol2 from the archive geometry, the frame of the "
-                          "-gh Hessian.", allow_frame_mismatch)
+        for path in (mol2_path, nab_path):
+            _check_frame(atoms, path, label, "the archive geometry of the log",
+                         "Build the mol2 from the archive geometry, the frame of the "
+                         "-gh Hessian.", allow_frame_mismatch)
         _compare_with_printed_modes(log_path, evals, label)
         return evecs
-    return _printed_modes(log_path, mol2_path, label, allow_frame_mismatch)
+    return _printed_modes(log_path, mol2_path, label, allow_frame_mismatch, nab_path)
 
 
-def _printed_modes(log_path, mol2_path, label, allow_frame_mismatch):
+def _printed_modes(log_path, mol2_path, label, allow_frame_mismatch, nab_path=None):
     """reference_modes for --modes printed: the modes, the precision and
     nosymm warnings, the frame check and the self-check."""
     log = utilities.GaussLog(log_path)
@@ -453,9 +487,9 @@ def _printed_modes(log_path, mol2_path, label, allow_frame_mismatch):
                 "--modes archive.")
     else:
         hint = "Build the mol2 from the geometry the frequency job printed."
-    deviation = _check_mode_frame(printed, mol2_path, label,
-                                  "the geometry the log prints its normal modes in",
-                                  hint, allow_frame_mismatch)
+    geometry = "the geometry the log prints its normal modes in"
+    deviation = _check_frame(printed, mol2_path, label, geometry, hint, allow_frame_mismatch)
+    _check_frame(printed, nab_path, label, geometry, hint, allow_frame_mismatch)
     if rotated and deviation is not None and deviation <= FRAME_TOLERANCE:
         logger.warning("{}: the frequency job ran without nosymm. {} matches the standard "
                        "orientation of the printed normal modes, but the archive Hessian "
@@ -597,18 +631,32 @@ def build_calculators(opts, ff=None, runner=None):
             reference.setdefault(_full_path(opts, filename), []).append(command)
 
     modes = getattr(opts, "modes", "printed")
+    allow = getattr(opts, "allow_frame_mismatch", False)
     # A -geigz in this same call is read after the calculators are built
     # (collect_data), so record its source now for the -ageig check.
     for filename in _flag_files(opts, "geigz"):
         _record_mode_source(_full_path(opts, filename), modes)
+    # Likewise the frames of a -gh in this call, for the -ah check; a call
+    # without -gh keeps those of the latest one (RDAT runs before CDAT).
+    gh_logs = [_full_path(opts, filename) for filename in _flag_files(opts, "gh")]
+    if gh_logs:
+        _record_hessian_frames(gh_logs)
+    # -ah: the k-th leap input is scored against the k-th -gh log.
+    hessian_inputs = [key[0] for key, commands in calculated.items() if "ah" in commands]
+    for in_path, (log_path, log_atoms) in zip(hessian_inputs, _REFERENCE_HESSIAN_FRAMES.items()):
+        for path in _structure_files(in_path):
+            _check_frame(log_atoms, path, "-ah " + os.path.basename(in_path),
+                         "the archive geometry of " + os.path.basename(log_path),
+                         "Build the mol2 from that geometry, the frame of the -gh Hessian.",
+                         allow)
     calcs = []
     for key, commands in calculated.items():
         in_path = key[0]
         eigenvectors = None
         if key in mode_logs:
+            mol2, nab = _structure_files(in_path)
             eigenvectors = reference_modes(
-                mode_logs[key], _mol2_of(in_path), modes=modes,
-                allow_frame_mismatch=getattr(opts, "allow_frame_mismatch", False))
+                mode_logs[key], mol2, modes=modes, allow_frame_mismatch=allow, nab_path=nab)
         calcs.append(calculators.AmberCalculator(
             os.path.dirname(in_path), os.path.basename(in_path), commands,
             ff=ff, invert=opts.invert, runner=runner, eigenvectors=eigenvectors))
@@ -630,6 +678,17 @@ def _mol2_of(in_path):
             if rel.endswith(".mol2"):
                 return os.path.join(os.path.dirname(in_path), rel)
     return _sibling(in_path, ".mol2")
+
+
+def _structure_files(in_path):
+    """The mol2 a leap input loads, and the file nab computes the Hessian at
+    when that is another one, else None: <stem>.pdb, or while it is missing
+    the <stem>.mol2 antechamber builds it from. An existing pdb is used as it
+    is, so it outlives a replaced mol2."""
+    mol2 = _mol2_of(in_path)
+    pdb = _sibling(in_path, ".pdb")
+    nab = pdb if os.path.isfile(pdb) else _sibling(in_path, ".mol2")
+    return mol2, (None if nab == mol2 else nab)
 
 
 def build_calculator(args, ff=None, runner=None):
