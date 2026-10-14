@@ -43,6 +43,12 @@ orientation; "archive" diagonalizes the archive Hessian (the one -gh reads),
 at full precision and in its input frame. Give the same --modes on the RDAT
 and CDAT lines.
 
+The Amber calculations use Generalized Born electrostatics (sander igb=1,
+nab gb=1) with the exterior dielectric constant of the QM reference: the Eps
+of the PCM block SCRF prints in the Gaussian logs, or 1 for gas-phase logs.
+All logs must agree; a call without a log uses that of the logs named before
+(RDAT runs before CDAT).
+
 Anything else from the old code (MacroModel / Jaguar / Tinker) is
 parsed but ignored.
 
@@ -311,6 +317,36 @@ def _record_hessian_frames(log_paths):
         except ValueError:
             atoms = None
         _REFERENCE_HESSIAN_FRAMES[os.path.abspath(path)] = atoms
+
+
+# The dielectric constant each Gaussian reference log ran in: 1.0 in the gas
+# phase, else the Eps of its PCM solvent. The Amber calculations take it as the
+# exterior dielectric constant of their Generalized Born electrostatics, so all
+# logs must agree. loop.py runs RDAT and CDAT as separate calls, so the logs are
+# recorded here as calls name them -- a module global, like _REFERENCE_MODE_SOURCE.
+_REFERENCE_EPSILON = OrderedDict()
+
+
+def _reference_epsilon(log_paths):
+    """Record the dielectric constant of each Gaussian log in `log_paths` and
+    return the one all recorded logs share; 1.0 (gas phase), with a warning,
+    while no log has been recorded. A missing log is left to the collectors
+    that read it."""
+    for path in log_paths:
+        path = os.path.abspath(path)
+        if path not in _REFERENCE_EPSILON and os.path.isfile(path):
+            _REFERENCE_EPSILON[path] = utilities.GaussLog(path).solvent_epsilon()
+    values = set(_REFERENCE_EPSILON.values())
+    if len(values) > 1:
+        raise ValueError(
+            "The QM reference logs ran in different media ({}), but the Amber electrostatics "
+            "take one dielectric constant.".format(", ".join(
+                "{} Eps {:g}".format(os.path.basename(p), e) for p, e in _REFERENCE_EPSILON.items())))
+    if not values:
+        logger.warning("No Gaussian reference log read; the Amber GB electrostatics use "
+                       "the gas-phase dielectric constant 1.")
+        return 1.0
+    return values.pop()
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +666,14 @@ def build_calculators(opts, ff=None, runner=None):
         for filename in _flag_files(opts, flag):
             reference.setdefault(_full_path(opts, filename), []).append(command)
 
+    # The medium of the QM reference sets the dielectric constant of the Amber
+    # GB electrostatics; a call without a Gaussian log keeps that of earlier ones.
+    gaussian_logs = [_full_path(opts, filename) for flag, _typ, _ in _GAUSSIAN_DISPATCH
+                     for filename in _flag_files(opts, flag)]
+    epsilon = _reference_epsilon(gaussian_logs + list(reference) + list(mode_logs.values()))
+    logger.log(20, "  -- Amber GB exterior dielectric constant {:g}, that of the QM "
+                   "reference".format(epsilon))
+
     modes = getattr(opts, "modes", "printed")
     allow = getattr(opts, "allow_frame_mismatch", False)
     # A -geigz in this same call is read after the calculators are built
@@ -659,7 +703,8 @@ def build_calculators(opts, ff=None, runner=None):
                 mode_logs[key], mol2, modes=modes, allow_frame_mismatch=allow, nab_path=nab)
         calcs.append(calculators.AmberCalculator(
             os.path.dirname(in_path), os.path.basename(in_path), commands,
-            ff=ff, invert=opts.invert, runner=runner, eigenvectors=eigenvectors))
+            ff=ff, invert=opts.invert, runner=runner, eigenvectors=eigenvectors,
+            epsilon=epsilon))
     for log_path, commands in reference.items():
         # NB: the reference geometry comes from <name>.mol2 (via <name>.in),
         # NOT from the Gaussian .log -- the .log path only supplies <name>.
@@ -667,7 +712,8 @@ def build_calculators(opts, ff=None, runner=None):
         stem = os.path.splitext(os.path.basename(log_path))[0]
         calcs.append(calculators.AmberCalculator(
             os.path.dirname(log_path), stem + ".in", commands,
-            prefix="gaus", runner=runner, src_name=os.path.basename(log_path)))
+            prefix="gaus", runner=runner, src_name=os.path.basename(log_path),
+            epsilon=epsilon))
     return calcs
 
 

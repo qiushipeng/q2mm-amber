@@ -592,6 +592,48 @@ class GaussLog(File):
             return True
         return any("Coord Atom Element:" in line for line in self.lines)
 
+    # The PCM block SCRF prints names the solvent with its dielectric constant,
+    # on the same line for a named solvent and on the next for a generic one:
+    #  Solvent              : DiethylEther, Eps=   4.240000 Eps(inf)=   1.829527
+    #  Solvent              : Generic,
+    #                         Eps                           =   4.000000
+    SOLVENT_LINE = re.compile(r"^\s*Solvent\s*:")
+    EPS_VALUE = re.compile(r"\bEps\s*=\s*([0-9.]+)")
+
+    def solvent_epsilon(self) -> float:
+        """The dielectric constant of the medium the job ran in: the Eps of the
+        PCM block SCRF prints (PCM, CPCM, SMD), or 1.0 for a gas-phase job (no
+        SCRF in any route section).
+
+        Raises:
+            ValueError: SCRF without a readable Eps (a solvent model this does
+                not read), or job steps run in different media
+
+        Returns:
+            float: the dielectric constant
+        """
+        lines = self.lines
+        values = set()
+        for i, line in enumerate(lines):
+            if not self.SOLVENT_LINE.match(line):
+                continue
+            match = self.EPS_VALUE.search(line)
+            if match is None and i + 1 < len(lines):
+                match = self.EPS_VALUE.search(lines[i + 1])
+            if match is None:
+                raise ValueError("{}: no Eps on the PCM solvent line: {}".format(
+                    self.filename, line.strip()))
+            values.add(float(match.group(1)))
+        if len(values) > 1:
+            raise ValueError("{}: job steps ran in different media, Eps {}".format(
+                self.filename, sorted(values)))
+        if values:
+            return values.pop()
+        if any("scrf" in route.lower() for route in self.route_sections()):
+            raise ValueError("{}: SCRF in the route, but no PCM solvent line with Eps; "
+                             "the solvent model is not one this reads".format(self.filename))
+        return 1.0
+
     @property
     def esp_rms(self):
         """Returns the esp_rms (Electrostatic potential ?? TODO)
@@ -1232,6 +1274,9 @@ class AmberUtilities(object):
   maxcyc    = {maxcyc},
   ncyc      = {ncyc},
   cut       = 15.0,
+  igb       = 1,
+  extdiel   = {extdiel:.6f},
+  rgbmax    = 15.0,
   ntpr      = 10000,
   ntwx      = 0,
   ntb       = 0
@@ -1256,14 +1301,17 @@ class AmberUtilities(object):
 
     # nab program that computes the mass-weighted Hessian with nmode. Needs the
     # nmode patch described in OPTIMIZATION.md section 0 to write hessian.mat.
-    # The dielectric constant (80.4, water) currently has to be changed by hand.
+    # Electrostatics: Generalized Born (gb=1, the only model nmode takes second
+    # derivatives of) with the exterior dielectric constant of the QM reference,
+    # as in SANDER_MIN. No dielc: nab scales every charge by 1/sqrt(dielc).
+    # rgbmax may not exceed cut in nab's GB second derivatives.
     NAB_HESSIAN = """molecule m;
 float x[4000], fret;
 
 m = getpdb("{pdb}");
 readparm(m, "{prmtop}");
 
-mm_options( "cut=15., ntpr=1, nsnb=99999, diel = C, dielc = 80.40" );
+mm_options( "cut=15., ntpr=1, nsnb=99999, gb=1, epsext={epsext:.6f}, rgbmax=15." );
 mme_init( m, NULL, "::Z", x, NULL);
 setxyz_from_mol( m, NULL, x );
 
@@ -1537,9 +1585,10 @@ nmode( x, 3*m.natoms, mme2, 0, 0, 0.0, 0.0, 0);"""
     # -- engine inputs -------------------------------------------------------
 
     @classmethod
-    def sander_min_input(cls, maxcyc, ncyc):
-        """sander minimization input; maxcyc=0 gives a single point."""
-        return cls.SANDER_MIN.format(maxcyc=maxcyc, ncyc=ncyc)
+    def sander_min_input(cls, maxcyc, ncyc, epsilon=1.0):
+        """sander minimization input; maxcyc=0 gives a single point. `epsilon`
+        is the exterior dielectric constant of the GB electrostatics."""
+        return cls.SANDER_MIN.format(maxcyc=maxcyc, ncyc=ncyc, extdiel=epsilon)
 
     @classmethod
     def sander_traj_input(cls):
@@ -1568,8 +1617,10 @@ nmode( x, 3*m.natoms, mme2, 0, 0, 0.0, 0.0, 0);"""
         return "\n".join(script) + "\n"
 
     @classmethod
-    def nab_hessian_input(cls, pdb, prmtop):
-        return cls.NAB_HESSIAN.format(pdb=pdb, prmtop=prmtop)
+    def nab_hessian_input(cls, pdb, prmtop, epsilon=1.0):
+        """nab Hessian program; `epsilon` is the exterior dielectric constant
+        of the GB electrostatics."""
+        return cls.NAB_HESSIAN.format(pdb=pdb, prmtop=prmtop, epsext=epsilon)
 
     # -- engine outputs ------------------------------------------------------
 

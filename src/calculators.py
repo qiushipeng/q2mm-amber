@@ -277,7 +277,7 @@ class AmberCalculator(Calculator):
 
     def __init__(self, work_dir, leap_input, commands, ff=None, invert=None,
                  prefix="amber", n_processes=1, runner=None, src_name=None,
-                 eigenvectors=None):
+                 eigenvectors=None, epsilon=1.0):
         """
         Args:
             work_dir (str): directory holding the leap input, mol2 and frcmod.
@@ -298,6 +298,9 @@ class AmberCalculator(Calculator):
                 default the leap input's basename.
             eigenvectors (np.ndarray, optional): the reference normal modes
                 (n_modes x 3N, normalized, mass-weighted) for "ageig".
+            epsilon (float): exterior dielectric constant of the Generalized
+                Born electrostatics in sander and nab; that of the QM
+                reference (1.0, gas phase, by default).
         """
         super(AmberCalculator, self).__init__(work_dir, commands, n_processes)
         unknown = [c for c in self.commands if c not in AMBER_COMMANDS]
@@ -314,6 +317,7 @@ class AmberCalculator(Calculator):
         self.name = self.leap_input.name
         self.prefix = prefix
         self.invert = invert
+        self.epsilon = epsilon
         self.runner = runner
         self.src_name = src_name or self.leap_input.filename
         self.eigenvectors = None if eigenvectors is None else np.asarray(eigenvectors, dtype=float)
@@ -485,7 +489,7 @@ class AmberCalculator(Calculator):
         ene = self._calc_name("ene")
         rst = self._calc_name("rst")
         self._remove(ene, rst)
-        self._write(min_in, AmberUtilities.sander_min_input(maxcyc, ncyc))
+        self._write(min_in, AmberUtilities.sander_min_input(maxcyc, ncyc, self.epsilon))
         self._run("sander -O -i {} -o {} -p {} -c {} -r {}".format(
             min_in, ene, self.PRMTOP, self.INPCRD, rst))
         # sander sometimes asks to be restarted; continue from the restart file.
@@ -563,7 +567,7 @@ class AmberCalculator(Calculator):
             self._run("antechamber -dr no -i {0}.mol2 -fi mol2 -o {0}.pdb -fo pdb".format(self.name))
         nab_in = os.path.join("calc", self.name + ".nab")
         nab_bin = os.path.join("calc", self.name)
-        self._write(nab_in, AmberUtilities.nab_hessian_input(pdb, "./" + self.PRMTOP))
+        self._write(nab_in, AmberUtilities.nab_hessian_input(pdb, "./" + self.PRMTOP, self.epsilon))
         self._run("nab -v {} -o {}".format(nab_in, nab_bin))
         self._run("./" + nab_bin)
         produced = self._path(mat)

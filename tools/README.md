@@ -241,11 +241,15 @@ parameter that this mol2 uses. LEaP can show a close-contact warning for a
 TS geometry. This warning can be physically correct.
 
 > **Note: the atom-types file.** The two generated LEaP inputs do not load
-> `THI.figure_atomtypes.leap`. Thus the custom atom types get no element, or
-> a wrong element, in the prmtop. For example, the THI model gets boron for
-> `BC` and `BH`. The Q2MM fit does not use the elements. GB, QM/MM and
-> element-based tools use them. To get the correct elements, put
+> `THI.figure_atomtypes.leap`. Thus tleap does not know the elements of the
+> custom atom types. It gives them no element, or a wrong element, in the
+> prmtop. For example, the THI model gets boron for `BC` and `BH`. tleap sets
+> the GB radius and the GB screening factor of each atom from its element. The
+> Q2MM fit uses these values in its GB electrostatics. For a QM reference in a
+> solvent (ε > 1), wrong elements give wrong Born radii. QM/MM and other
+> element-based tools also use the elements. To get the correct elements, put
 > `source THI.figure_atomtypes.leap` after the two `source leaprc` lines.
+> Refer to [`OPTIMIZATION.md`](../OPTIMIZATION.md) §2 and §4.
 
 ## TS seeds (`--allow-ts-seeds`)
 
@@ -293,6 +297,8 @@ because the fit has no other way to absorb it.
 2. Write the tleap script `MOL.in` for the fit. It must save `calc/prmtop`
    and `calc/inpcrd`, and it must use relative file names. Do not use
    `THI.figure.leap.in` without changes, because it uses absolute paths.
+   Put `source THI.figure_atomtypes.leap` after the two `source leaprc`
+   lines (refer to the note above).
 3. If the builder wrote a `.leap.mol2`, copy its `loadmol2` line into
    `MOL.in`. Also copy the `set … pert` and `bond` lines after it.
 4. In the parameter file, select the terms in `_ts_fit_report.csv` and in

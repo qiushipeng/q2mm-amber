@@ -273,6 +273,11 @@ In addition to the AMBER backend, this fork adds these features:
   of each run, Q2MM restores the frcmod from this backup. The fit rewrites
   the frcmod during a run, but each run starts from the same parameters. If
   you change the initial force field on purpose, delete the `.orig` file.
+* **Electrostatics from the QM reference**: sander and nab use the
+  Generalized Born (GB) model. Q2MM reads the dielectric constant ε from the
+  Gaussian reference logs. It uses the `Eps` of the PCM block, or 1 for a
+  gas-phase log. Upstream Q2MM uses a constant dielectric of 80.40 (water) in
+  the nab Hessian. Refer to [`OPTIMIZATION.md` §4](OPTIMIZATION.md).
 
 ---
 
@@ -285,6 +290,7 @@ In addition to the AMBER backend, this fork adds these features:
 | `OverflowError: Range exceeds valid bounds` | A `HYBR` parameter has an infinite bound. `HYBR` needs a finite `lower upper` pair on each line. |
 | The score changes very little, but the parameters change a lot | Residuals that the selected parameters cannot change control the objective. The usual cause is a forming or breaking contact that is **not bonded** in the mol2. Amber then scores the contact as a nonbonded clash with a very large Hessian element. Correct the topology, not the optimizer. |
 | `Hessian file missing: …hes` | AmberTools does not have the patch, or an earlier Amber step failed. |
+| `%FLAG ATOMIC_NUMBER` in `calc/prmtop` has −1, or 5 (boron), for custom atom types | tleap does not know the elements of the custom atom types. Put `source MOL_atomtypes.leap` after the two `source leaprc` lines in `MOL.in`. A QM reference in a solvent (ε > 1) needs the correct elements, because GB takes its radii from them. |
 
 `DIR` sets the directory for the `FFLD`, `PARM`, `FXATM` and `COMP -o` files.
 The run outputs (`ff_NNN.frcmod`, `swarm_particles/`,

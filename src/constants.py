@@ -220,44 +220,6 @@ KJMOLA = 'KJMOLA' # Used for Hessian, all Hessians are converted to KJMOLA on im
 KCALMOLA = 'KCALMOLA'
 
 
-# SCRIPTS
-NABC_HESSIAN = """#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include "sff.h"
-FILE* nabout;
-
-int main(int argc, char* argv[] )
-{
-    nabout = stdout;
-
-    molecule m;
-    float x[4000], fret;
-
-    m = getpdb( argv[2]);
-    readparm(m, argv[1]);
-
-    PARMSTRUCT_T* prm = rdparm( argv[1] );
-    int natm = prm->Natom;
-
-    m = getpdb( argv[2] );
-
-    setxyz_from_mol( m, NULL, x );
-
-    mm_options( "cut=15., ntpr=1, nsnb=99999, diel = C, dielc = 80.40" );
-
-    // nothing frozen or constrained
-    int* frozen = parseMaskString( "@ZZZ", prm, xyz, 2 );
-    int* constrained = parseMaskString( "@ZZZ", prm, xyz, 2 );
-
-    mme_init_sff( prm, frozen, constrained, NULL, NULL );
-
-    int nm = nmode( x, prm->Nat3, mme2, 0, 0, 0.0, 0.0, 0 );
-    printf("nmode returns %d\n", nm);
-}"""
-
-#TODO: QP Add nab Hessian script for the nab not nabc setup
-
 # region REGEX
 # COMMON
 # Match any float in a string.

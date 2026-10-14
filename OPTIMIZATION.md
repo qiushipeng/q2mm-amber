@@ -140,6 +140,7 @@ A minimal `MOL.in`:
 ```
 source leaprc.gaff2
 source leaprc.protein.ff19SB
+source MOL_atomtypes.leap
 loadamberparams MOL.frcmod
 mol = loadmol2 MOL.mol2
 saveamberparm mol calc/prmtop calc/inpcrd
@@ -160,10 +161,16 @@ Obey these rules for `MOL.in`:
   bonds. Copy the `loadmol2` line from `MOL.leap.in`, and the `set … pert`
   and `bond` lines after it. Use relative file names. Without these lines,
   the topology does not contain the forming bond.
-* Optional: put `source MOL_atomtypes.leap` after the two `source leaprc`
-  lines. Without this line, the custom atom types get no element or a wrong
-  element in the prmtop. The fit does not use the elements. GB, QM/MM and
-  element-based tools use them.
+* Put `source MOL_atomtypes.leap` after the two `source leaprc` lines.
+  `build_tsff.py` writes this file. tleap does not know the elements of the
+  custom atom types. Without this line, tleap gives them no element (atomic
+  number −1) or a wrong element (for example, boron for `BC` and `BH`).
+  tleap sets the GB radius and the GB screening factor of each atom from its
+  element. Thus each custom atom type gets the fallback values 1.5 Å and 0.8.
+  The fit uses these values in its GB electrostatics (§4). For a gas-phase QM
+  reference (ε = 1), they have no effect. For a QM reference in a solvent
+  (ε > 1), they give wrong Born radii. The line changes only `ATOMIC_NUMBER`,
+  `RADII` and `SCREEN` in the prmtop.
 
 ### The `frcmod` header: required
 
@@ -439,6 +446,57 @@ For the 97-atom log above, from a job without `nosymm` and `hpmodes`:
 | `printed`, mol2 in the archive frame | Stops: "differ by up to 14.795 A … The frequency job ran without nosymm …" |
 | `printed`, mol2 in the standard orientation | Runs, with the `hpmodes` (3.2%) and `nosymm` warnings. Self-check floor: 0.082. |
 | `archive`, mol2 in the archive frame | Runs with no warnings. The initial score is 6.13, against 6.24 for the row above. |
+
+The scores in this table come from an older version with a constant
+dielectric of 80.40. The current version gives different scores (refer to
+the next section).
+
+### Electrostatics: Generalized Born with the ε of the QM reference
+
+sander and nab calculate the electrostatics with the Generalized Born (GB)
+model. sander uses `igb = 1, extdiel = ε`. nab uses `gb=1, epsext=ε`. ε is
+the dielectric constant of the solvent outside the molecule. Inside the
+molecule, the dielectric constant is 1.
+
+Q2MM reads ε from the Gaussian logs that `RDAT` and `CDAT` name: `-gh`,
+`-geigz`, `-ge*`, `-gabo`, `-gaao`, `-gato`, and the log of `-ageig`.
+
+* A log from a job with `SCRF` (PCM, CPCM or SMD) has a PCM block. Q2MM
+  reads `Eps` from the solvent line of this block, for example
+  `Solvent : DiethylEther, Eps= 4.240000`.
+* A log from a job without `SCRF` is a gas-phase reference. Then ε = 1. With
+  ε = 1, GB gives the same energies and the same Hessian as Coulomb in vacuum.
+* A `CDAT` line without a log, for example `-ah MOL.in`, uses the ε of the
+  logs that `RDAT` read.
+
+The run log shows the value:
+
+```
+  -- Amber GB exterior dielectric constant 4.24, that of the QM reference
+```
+
+Q2MM stops with an error in these conditions:
+
+* The logs ran in different media.
+* A log has `SCRF`, but no `Eps`. An example is `SCRF=Dipole`.
+
+Q2MM does not read point charges (`Charge`) or ONIOM embedding. For such a
+log, Q2MM uses only the `Eps` of its PCM block, or 1 without `SCRF`.
+
+GB takes the radius and the screening factor of each atom from the prmtop.
+tleap sets these values from the element of the atom. For the custom atom
+types, put `source MOL_atomtypes.leap` in `MOL.in` (§2). Without this line,
+a QM reference in a solvent (ε > 1) gives wrong Born radii.
+
+sander and nab use `cut = 15` Å and `rgbmax = 15` Å. nab cannot calculate a
+GB Hessian with `rgbmax` larger than `cut`. Thus the largest distance between
+two atoms of the molecule must be less than 15 Å. If the distance is larger,
+the cutoff removes some interactions.
+
+> **Scores from older versions are different.** Older versions of
+> q2mm-amber used a constant dielectric of 80.40 (water) in the nab Hessian,
+> and 1 in sander. Do not compare scores from the two versions. For example,
+> the start eigenmode score of one TS model changed from 6.133 to 5.905.
 
 ### `FXATM`: fixed atoms
 
@@ -897,3 +955,5 @@ is weak.
 | `-ah …: the archive geometry of … and … differ by up to … the QM and force-field frames do not match` | The mol2 or the pdb is not in the frame of the `-gh` log. Usually it is a file from an earlier frequency job with a different input orientation. Build the mol2 from the archive geometry of that log. Delete the old pdb, because Q2MM makes the pdb again only when it does not exist (§4). |
 | `-ageig …: … differ by up to … the QM and force-field frames do not match` | The mol2 or the pdb is not in the frame of the normal modes. Usually the frequency job ran without `nosymm`. You then built the mol2 from the archive geometry. There are three solutions (§4, `--modes`). Use `--modes archive` on both lines. Or build the mol2 in the standard orientation of the log. Or run the frequency job again with `nosymm freq=hpmodes`. A pdb from an older mol2 also causes this error. Delete that pdb. |
 | `-ageig … uses --modes …, but -geigz read … with --modes …` | The `RDAT` and `CDAT` lines use different mode sources. Give the same `--modes` on both lines. |
+| `The QM reference logs ran in different media (…)` | The Gaussian logs of `RDAT` and `CDAT` have different `Eps` values, or some logs are gas phase. Use reference logs from one medium (§4, Electrostatics). |
+| `SCRF in the route, but no PCM solvent line with Eps` | The job used a solvent model that Q2MM does not read, for example `SCRF=Dipole`. Use PCM, CPCM or SMD (§4, Electrostatics). |
