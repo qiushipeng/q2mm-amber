@@ -1,55 +1,42 @@
 #!/usr/bin/env python3
-"""
-Estimates bond and angle force constants, prepares a force field for Q2MM parameterization.
+"""Estimate bond and angle parameters with the Seminario/FUERZA projection.
 
-Script takes in the structural, hessian, and ff files to output a new forcefield with initial
-parameters estimated via the Seminario/FUERZA method. Currently, only mol2, Gaussian .log, and 
-Amber .frcmod or MacroModel MM3* .fld filetypes are supported (respectively). If requested, it
-will do this estimation after inverting the Hessian for a TSFF or zero out the values necessary
-to be 0 before starting parameterization of the force field. Currently, it will always set
-equilibrium bond length and angle parameter values to the average of the structural files given
-as input.
+Projection always uses an unweighted Cartesian Hessian in Hartree/Bohr^2
+and bond lengths in Bohr. Geometry files are in Angstrom; equilibrium bond
+lengths and angles are written in Angstrom and degrees. Output conversion
+is separate: Amber uses kcal/mol with a factor 1/2 for BOTH force constants;
+MM3* uses the native STR/BND factors from its .fld header.
 
-Torsion parameter value estimation is not currently supported both due to lack of treatment in
-Jorge Seminario's original 1998 paper, but also because we keep them at zero during the Q2MM TSFF
-parameterization until all other parameter values are well-determined, otherwise the torsions will
-simply be random.
+Amber input: .frcmod plus MOL2. MM3* input: .fld plus a MacroModel .mmo
+listing containing coordinates and FF Line assignments (DEBG 56). Gaussian
+frequency archives provide the reference geometry and raw Cartesian Hessian.
+An optional --hessian .npy/text matrix can replace the archive matrix;
+--reverse declares that supplied matrix to be mass weighted (masses in amu).
 
-This step should be done after RESP calculation, generation of a force field file, and testing that 
-ensures that all interactions in the structures are covered by a corresponding parameter in the
-force field file (compatibility via compare.py or calculate.py usage typically).
+--invert VALUE temporarily mass weights the Hessian, replaces the TS
+eigenvalue with VALUE in kJ/(mol*A^2*amu), as RDAT -gh -i does, and removes
+the mass weighting before projection. This is independent of --reverse.
 
-Portions of code adapted from Samuel Genheden and can be found at
-https://github.com/SGenheden/Seminario
+Adapted in part from https://github.com/SGenheden/Seminario.
 """
 
 from __future__ import division, print_function, absolute_import
 import argparse
-from collections import Counter
 import copy
 import glob
 import os
-import sys
-from typing import List
+import shlex
 
 import numpy as np
 
-from src.math_util import invert_ts_curvature, reform_hessian
+import math_util
 
 import logging
 import logging.config
 import constants as co
 import utilities
-from utilities import mass_weight_force_constant, mass_weight_hessian, GaussLog, Frcmod, Mol2
-
-from data_structs import (
-    FF,
-    Atom,
-    AmberFF,
-    ParAMBER,
-    Param,
-    Structure
-)
+from utilities import GaussLog, Mol2
+from data_structs import Atom, AmberFF, MM3Param
 
 logging.config.dictConfig(co.LOG_SETTINGS)
 logger = logging.getLogger(__file__)
@@ -80,7 +67,10 @@ def sub_hessian(hessian, atom1: Atom, atom2: Atom, ang_to_bohr=False) -> tuple:
     vec12 = atom1.coords - atom2.coords
     if ang_to_bohr:
         vec12 = vec12 / co.BOHR_TO_ANG
-    vec12 = vec12 / np.linalg.norm(vec12)
+    norm = np.linalg.norm(vec12)
+    if not np.isfinite(norm) or norm == 0:
+        raise ValueError("Bond projection needs distinct, finite atomic coordinates.")
+    vec12 = vec12 / norm
 
     submat = -hessian[
         3 * (atom1.index - 1) : 3 * (atom1.index - 1) + 3,
@@ -166,22 +156,20 @@ def seminario_sum(vec, eigval, eigvec) -> float:
     return ssum
 
 
-def seminario_bond(atoms: list, hessian, scaling=0.963, ang_to_bohr=False) -> float:
+def seminario_bond(atoms: list, hessian, scaling=0.963, ang_to_bohr=True) -> float:
     """Estimate the bond force constant using the Seminario method, i.e. by
     analysing the Hessian submatrix. Will average over atom1->atom2 and
     atom2->atom1 force constants.
 
     Args:
         atoms (list[Atom]): atoms involved in the bond for which to estimate a force constant
-        hessian (np.ndarray): Hessian matrix
-        scaling (float, optional): Hessian scaling factor, dependent on Hessian calculation level of theory. Defaults to 0.963 for DFT.
-        ang_to_bohr (bool, optional): whether to convert length units from Angstrom to Bohr radii. Defaults to False.
+        hessian (np.ndarray): Unweighted Cartesian Hessian in Hartree/Bohr^2.
+        scaling (float, optional): Curvature/energy multiplier. Defaults to 0.963.
+        ang_to_bohr (bool, optional): Convert Angstrom coordinates to Bohr.
 
     Note:
-        Multiplication by a scaling factor is necessary because different Quantum-level
-        calculations are often off by some consistent factor. In the case of DFT, values
-        are typically overestimated, so DFT calculations must be scaled down by ~0.963x,
-        hence the default scaling of 0.963.
+        The default is the QFUERZA paper's energy scaling factor. A frequency
+        scaling factor would need to be squared before multiplying curvature.
 
     Returns:
         float: estimated bond force constant in AU
@@ -198,13 +186,10 @@ def seminario_bond(atoms: list, hessian, scaling=0.963, ang_to_bohr=False) -> fl
 
     f21 = seminario_sum(vec21, eigval21, eigvec21)
 
-    # 2240.87 is from Hartree/Bohr ^2 to kcal/mol/A^2
-    # 418.4 is kcal/mol/A^2 to kJ/mol/nm^2
-
     if f12 <= 0 or f21 <= 0:
         logger.log(
             logging.DEBUG,
-            "Estimated force constant between atoms: {}, {} <= 0, with raw kJ/molA estimates: {} {}!\nSetting to 0.5 instead.".format(
+            "Nonpositive bond projections for atoms {}, {} (Hartree/Bohr^2): {} {}".format(
                 atoms[0].index, atoms[1].index, f12, f21
             ),
         )
@@ -247,7 +232,7 @@ def seminario_bond(atoms: list, hessian, scaling=0.963, ang_to_bohr=False) -> fl
     if f <= 0:
         logger.log(
             logging.WARNING,
-            "WARNING: Estimated force constant between atoms: {}, {} <= 0, with (raw, scaled) kJ/molA estimate: {} {}!\nPlease visualize normal modes to confirm transition states are correct.".format(
+            "Nonpositive bond curvature for atoms {}, {} (raw, scaled Hartree/Bohr^2): {} {}".format(
                 atoms[0].index, atoms[1].index, f, f * scaling
             ),
         )
@@ -256,26 +241,24 @@ def seminario_bond(atoms: list, hessian, scaling=0.963, ang_to_bohr=False) -> fl
 
 
 def seminario_angle(
-    atoms: list, hessian, scaling=0.963, convert=False, ang_to_bohr=False
+    atoms: list, hessian, scaling=0.963, convert=False, ang_to_bohr=True
 ) -> float:
     """Estimate the angle force constant using the Seminario method, i.e. by
     analysing the Hessian submatrix.
 
     Args:
         atoms (list[Atom]): list of Atom objects for which to estimate the angle force constant
-        hessian (numpy.ndarray): Hessian matrix
-        scaling (float, optional): Hessian scaling factor, dependent on Hessian calculation level of theory. Defaults to 0.963 for DFT.
+        hessian (numpy.ndarray): Unweighted Cartesian Hessian in Hartree/Bohr^2.
+        scaling (float, optional): Curvature/energy multiplier. Defaults to 0.963.
         convert (bool, optional): whether to convert force constant from AU to kJ/mol. Defaults to False.
-        ang_to_bohr (bool, optional): whether to convert structure length units from Angstrom to Bohr. Defaults to False.
+        ang_to_bohr (bool, optional): Convert Angstrom bond lengths to Bohr.
 
     Note:
-        Multiplication by a scaling factor is necessary because different Quantum-level
-        calculations are often off by some consistent factor. In the case of DFT, values
-        are typically overestimated, so DFT calculations must be scaled down by ~0.963x,
-        hence the default scaling of 0.963.
+        The default is the QFUERZA paper's energy scaling factor. A frequency
+        scaling factor would need to be squared before multiplying curvature.
 
     Returns:
-        float: estimated angle force constant
+        float: angular curvature in Hartree/rad^2 (kJ/mol/rad^2 if convert=True).
     """
 
     assert len(atoms) == 3
@@ -283,7 +266,11 @@ def seminario_angle(
     vec32, eigval32, eigvec32 = sub_hessian(hessian, atoms[2], atoms[1])
 
     un = np.cross(vec32, vec12)
-    un = un / np.linalg.norm(un)
+    norm = np.linalg.norm(un)
+    if not np.isfinite(norm) or norm < 1e-8:
+        logger.warning("Cannot project a linear or degenerate angle: %s", atoms)
+        return np.nan
+    un = un / norm
     upa = np.cross(un, vec12)
     upc = np.cross(vec32, un)
 
@@ -297,23 +284,28 @@ def seminario_angle(
     if ang_to_bohr:
         len32 = len32 / co.BOHR_TO_ANG
 
+    if sum1 == 0 or sum2 == 0 or len12 == 0 or len32 == 0:
+        return np.nan
     f12 = 1.0 / (sum1 * len12 * len12)
     f32 = 1.0 / (sum2 * len32 * len32)
 
     if f12 <= 0 or f32 <= 0:
         logger.log(
             logging.DEBUG,
-            "Estimated force constant between atoms: {}, {}, {} <= 0, with raw kJ/molA estimates: {}, {}!".format(
+            "Nonpositive angular compliance for atoms {}, {}, {} (1/Hartree): {}, {}".format(
                 atoms[0].index, atoms[1].index, atoms[2].index, f12, f32
             ),
         )
 
-    f = 1.0 / (1.0 / (sum1 * len12 * len12) + 1.0 / (sum2 * len32 * len32))
+    denominator = f12 + f32
+    if denominator == 0 or not np.isfinite(denominator):
+        return np.nan
+    f = 1.0 / denominator
 
     if f < 0:
         logger.log(
             logging.WARNING,
-            "WARNING: Estimated force constant between atoms: {}, {}, {} < 0, with (raw, scaled) kJ/molA estimate: {} {}!\nPlease visualize normal modes to confirm transition states are correct.".format(
+            "Nonpositive angle curvature for atoms {}, {}, {} (raw, scaled Hartree/rad^2): {} {}".format(
                 atoms[0].index, atoms[1].index, atoms[2].index, f, f * scaling
             ),
         )
@@ -334,10 +326,8 @@ def seminario_angle(
                 + str(atoms),
             )
 
-    # 627.5095 is Hartree to kcal/mol
-    # 4.184 is kcal/mol to kJ/mol
     if convert:
-        return scaling * 627.5095 * 4.184 * f
+        return scaling * co.HARTREE_TO_KJMOL * f
     else:
         return scaling * f
 
@@ -347,600 +337,352 @@ def seminario_angle(
 # region Arguments
 
 
+def _positive_number(value):
+    value = float(value)
+    if not np.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("value must be finite and positive")
+    return value
+
+
 def return_params_parser(add_help=True) -> argparse.ArgumentParser:
-    """Returns an argparse.ArgumentParser object for the selection of
-    parameters.
-
-    Args:
-        add_help (bool, optional): toggle acceptance of -h for descriptive help information to be output. Defaults to True.
-
-    Returns:
-        argparse.ArgumentParser: Parser for seminario.py command-line arguments
-    """
-    if add_help:
-        description = __doc__
-        parser = argparse.ArgumentParser(
-            formatter_class=argparse.RawTextHelpFormatter, description=description
-        )
-    else:
-        parser = argparse.ArgumentParser(add_help=False)
-    io_group = parser.add_argument_group("io")
-    io_group.add_argument(
-        "-o",
-        "--ff-out",
-        type=str,
-        metavar="project.seminario.frcmod or project.seminario.fld",
-        help=(
-            "Use mol2 file and Gaussian Hessian to generate a new force field where\n"
-            "each force constant value is replaced\n"
-            "by its value estimated from the seminario calculation\n"
-            "of force constants in the structure."
-        ),
-    )
-    io_group.add_argument(
-        "-i",
-        "--ff-in",
-        metavar="project.frcmod or project.fld",
-        help="Path to input force field file.",
-    )
-    io_group.add_argument(
-        "--mol",
-        "-m",
-        type=str,
-        nargs="+",
-        metavar="structure.mol2",
-        help="Read these mol2 files, units are in Angstrom.",
-    )
-    io_group.add_argument(
-        "--log",
-        "-gl",
-        type=str,
-        nargs="+",
-        metavar="gaussian.log",
-        help="Gaussian Hessian is extracted from this .log file for seminario calculations. Units are in AU.",
-    )
-    io_group.add_argument(
-        "--mm-log",
-        "-ml",
-        type=str,
-        nargs="+",
-        metavar="macromodel.log",
-        help="MacroModel Hessian is extracted from this .log file for seminario calculations. Units are in kJ/mol and Angstrom.",
-    )
-    # io_group.add_argument(
-    #     "--fchk",
-    #     "-gf",
-    #     type=str,
-    #     metavar="gaussian.fchk",
-    #     default=None,
-    #     help="Gaussian Hessian and structure are extracted from this .fchk file for seminario calculations. Units are in Bohr.",
-    # ) TODO Support for this is not a priority, but it would be nice to later have the option of just an fchk (+ FF) as input.
-    options_group = parser.add_argument_group("options")
-    options_group.add_argument(
-        "--prep",
-        action="store_true",
-        default=False,
-        help="Flag indicating that the force field should also be prepared with zeroed out bond dipoles/charges and torsional terms (V1, V2, V3).",
-    )
-    options_group.add_argument(
-        "--skip-dummy",
-        default=False,
-        action="store_true",
-        help="Flag indicating that any dummy atom-related parameters should be skipped.",
-    )
-    options_group.add_argument(
-        "--raw-fuerza",
-        default=False,
-        action="store_true",
-        help="Run FUERZA, not QFUERZA; do not output an approximated FC value for FCs which FUERZA is known to overestimate."
-    )
-    options_group.add_argument(
-        "--invert",
-        default=False,
-        action="store_true",
-        help="Flag indicating that the Hessian curvature should be inverted (for TSs). Please read publications for more context.",
-    )
-    options_group.add_argument(
-        "--individualize",
-        action="store_true",
-        default=False,
-        help="Flag indicating that seminario-estimated FFs should be exported for each structure as opposed to averaging over all structures given.",
-    )
+    parser = argparse.ArgumentParser(description=__doc__, add_help=add_help,
+                                     formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument("-i", "--ff-in", required=True,
+                        help="Amber .frcmod or MM3* .fld with OPT parameters.")
+    parser.add_argument("-o", "--ff-out", required=True,
+                        help="Output force-field path.")
+    geometry = parser.add_mutually_exclusive_group(required=True)
+    geometry.add_argument("-m", "--mol", nargs="+",
+                          help="Amber MOL2 file(s), in the Gaussian archive's atom order and frame.")
+    geometry.add_argument("--mmo", nargs="+",
+                          help="MM3* MacroModel listing(s), with FF Line assignments and DEBG 56 coordinates.")
+    parser.add_argument("-gl", "--log", nargs="+", required=True,
+                        help="Gaussian frequency log(s), one per structure. Archive Hessians are unweighted AU.")
+    parser.add_argument("--hessian", nargs="+",
+                        help="Optional full 3N x 3N matrix file(s), .npy or whitespace text, replacing the archive Hessians.")
+    parser.add_argument("--hessian-units", choices=(co.GAUSSIAN, co.KJMOLA),
+                        default=co.GAUSSIAN,
+                        help="Matrix-file units: AU=Hartree/Bohr^2 (default), KJMOLA=kJ/(mol*A^2); per amu with --reverse.")
+    parser.add_argument("--reverse", action="store_true",
+                        help="The --hessian matrices are mass weighted using masses in amu; unweight the full matrix before projection.")
+    parser.add_argument("--invert", type=_positive_number, metavar="EIGENVALUE",
+                        help="Replace the mass-weighted TS eigenvalue with this value in kJ/(mol*A^2*amu), as RDAT -gh -i.")
+    parser.add_argument("--scale", type=_positive_number, default=0.963,
+                        help="Curvature/energy multiplier (default 0.963); a frequency multiplier must be squared first.")
+    parser.add_argument("--prep", action="store_true",
+                        help="Zero selected torsions and, for MM3*, bond dipoles. MOL2 partial charges are retained.")
+    parser.add_argument("--skip-dummy", action="store_true",
+                        help="Skip parameters involving dummy atoms.")
+    parser.add_argument("--raw-fuerza", action="store_true",
+                        help="Legacy alias: this implementation uses the Seminario/FUERZA projection without empirical H-angle substitution.")
+    parser.add_argument("--individualize", action="store_true",
+                        help="Write a separate force field for every structure.")
     return parser
 
-
-# endregion Arguments
 
 # region FC Derivers & Averagers
 
 # region AMBER
 
-def derive_bf_param(
-    param: ParAMBER,
-    structs: List[Structure],
-    hessians: List[np.ndarray],
-    ang_to_bohr=False,
-) -> float:
-    """Returns estimated bond force constant for param.
+def _matches_param(param, dof, type_dict):
+    if isinstance(param, MM3Param):
+        return dof.ff_row == param.ff_row
+    return utilities.is_same_type_DOF(param.atom_types, type_dict[dof])
 
-     Estimates the bond force constant of the parameter based on the structures and hessians given,
-     matching the structure's bonds to the force field parameter by atom type matching and then
-     averaging over the force constants estimated for each bond which matches the force field parameter.
 
-    Args:
-        param (Param): bond force constant parameter to estimate
-        structs (List[Structure]): structures (in Angstroms) to use as geometric basis for estimation method.
-        type_dict (dict): dictionary containing the atom types associated with each DOF in the structure,
-        of the form (dof:DOF, atom_types:list)
-        hessians (List[np.ndarray]): Hessian matrices, 2nd derivative of potential energy surface of structure
-        calculated (kJ/(mol*A^2), Cartesian, must be in order matching the structs)
-        at the electronic structure level of theory or above to serve as a quantum-level reference of TS dynamics.
-        ang_to_bohr (bool, optional): Whether length/position values need to be converted from Angstrom to Bohr.
-        Defaults to False because Hessian units default to kJ/(mol*Angstrom^2) and structures are in Angstrom.
+def _has_dummy_match(param, structures):
+    for struct in structures:
+        types = struct.get_DOF_atom_types_dict()
+        for dof in struct.bonds + struct.angles:
+            if _matches_param(param, dof, types) and any(
+                    atom.is_dummy for atom in struct.get_atoms_in_DOF(dof)):
+                return True
+    return False
 
-    Returns:
-        float: estimated bond force constant
-    """
-    # It is necessary to average over multiple bonds in the structure which match
-    # to the same atom type interactions in the force field.
-    match_count = 0
-    match_vals = []
+
+def _valid_curvature(value):
+    value = np.real_if_close(value, tol=1000)
+    return not np.iscomplexobj(value) and np.isfinite(value) and value > 0
+
+
+def _derive_force_constant(param, structs, hessians, kind, ang_to_bohr, scaling):
+    if len(structs) != len(hessians):
+        raise ValueError("Each structure must have one Hessian.")
+    values = []
+    matched = 0
+    method = seminario_bond if kind == "bonds" else seminario_angle
     for struct, hessian in zip(structs, hessians):
-        type_dict = struct.get_DOF_atom_types_dict()
-        for bond in struct.bonds:
-            if (
-                utilities.is_same_type_DOF(param.atom_types, type_dict[bond]) #TODO this works properly for amber, so need to move type_dict to per structure basis outside this module passed into this method
-            ):  
-                match_count += 1
-                s_bond = seminario_bond(
-                    atoms=struct.get_atoms_in_DOF(bond),
-                    hessian=hessian,
-                    ang_to_bohr=ang_to_bohr,
-                )
-                if s_bond < 0 or np.iscomplex(s_bond):
-                    logger.log(
-                        logging.WARN,
-                        "Invalid estimate of param {} in structure {}".format(
-                            param, struct.origin_name
-                        ),
-                    )
-
-                # The below reverse-massweighting of the force constant is only necessary if the mass-weighted
-                # Hessian is used.
-                s_bond = mass_weight_force_constant(s_bond, struct.get_atoms_in_DOF(bond), reverse=True, rm = False)
-                logger.log(
-                    logging.DEBUG, "Seminario (KJMOLA)" + str(bond) + ": " + str(s_bond)
-                )
-                # TODO retest PO method p_bond = po_bond(struct.get_atoms_in_DOF(bond), hessian, ang_to_bohr)
-                if s_bond > 0 and not np.iscomplex(s_bond):
-                    match_vals.append(
-                        s_bond
-                    )  # only includes estimate if it is valid, warnings are triggered upon calculation. bonds where all structures have invalid estimates should simply remain unchanged from input.
-    if match_count <= 0:
-        logger.log(
-            logging.WARN,
-            "No bonds in the structures match parameter atom types for parameter: "
-            + str(param),
-        )
+        types = struct.get_DOF_atom_types_dict()
+        for dof in getattr(struct, kind):
+            if _matches_param(param, dof, types):
+                matched += 1
+                value = method(struct.get_atoms_in_DOF(dof), hessian,
+                               ang_to_bohr=ang_to_bohr, scaling=scaling)
+                if _valid_curvature(value):
+                    values.append(float(np.real(value)))
+                else:
+                    logger.warning("Invalid %s projection at FF row %s in %s: %s",
+                                   kind, param.ff_row, struct.origin_name, value)
+    if not values:
+        logger.warning("FF row %s: %s; retaining its input value.", param.ff_row,
+                       "no matching interactions" if not matched else "no valid projections")
         return None
-    else:
-        if len(match_vals) == 0:
-            logger.log(
-                logging.WARNING,
-                "WARNING: All structures with interactions matching parameter {} have invalid estimates so it will not be changed. Please review normal modes.".format(
-                    param
-                ),
-            )
-            return None
-
-        averaged_fc = sum([float(fc) for fc in match_vals]) / float(len(match_vals))
-        return averaged_fc
+    return float(np.mean(values))
 
 
-def derive_af_param(
-    param: Param,
-    structs: List[Structure],
-    hessians: List[np.ndarray],
-    ang_to_bohr=False,
-) -> float:
-    """Returns estimated angle force constant for param.
-
-     Estimates the angle force constant of the parameter based on the structures and hessians given,
-     matching the structure's angles to the force field parameter by atom type matching and then
-     averaging over the force constants estimated for each angle which matches the force field parameter.
-
-    Args:
-        param (Param): bond force constant parameter to estimate
-        structs (List[Structure]): structures (in Angstroms) to use as geometric basis for estimation method.
-        hessians (List[np.ndarray]): Hessian matrices, 2nd derivative of potential energy surface of structure
-        calculated (kJ/(mol*A^2), Cartesian, must be in order matching the structs)
-        at the electronic structure level of theory or above to serve as a quantum-level reference of TS dynamics.
-        ang_to_bohr (bool, optional): Whether length/position values need to be converted from Angstrom to Bohr.
-        Defaults to False because Hessian units default to kJ/(mol*Angstrom^2) and structures are in Angstrom.
-
-    Returns:
-        float: estimated angle force constant
-    """
-    # It is necessary to average over multiple bonds in the structure which match
-    # to the same atom type interactions in the force field.
-    match_count = 0
-    match_vals = []
-    for struct, hessian in zip(structs, hessians):
-        type_dict = struct.get_DOF_atom_types_dict()
-        for angle in struct.angles:
-            if (
-                utilities.is_same_type_DOF(param.atom_types, type_dict[angle]) #TODO if this works properly for amber, then need to move type_dict to per structure basis outside this module passed into this method
-            ):
-                match_count += 1
-                s_angle = seminario_angle(
-                    struct.get_atoms_in_DOF(angle), hessian, ang_to_bohr=ang_to_bohr
-                )
-                
-                if s_angle < 0 or np.iscomplex(s_angle):
-                    logger.log(
-                        logging.WARN,
-                        "Invalid estimate of param {} in structure {}".format(
-                            param, struct.origin_name
-                        ),
-                    )
-                s_angle = mass_weight_force_constant(s_angle, struct.get_atoms_in_DOF(angle), reverse=True, rm = False)
-                logger.log(
-                    logging.DEBUG,
-                    "Seminario (KJMOLA)" + str(angle) + ": " + str(s_angle),
-                )
-                if s_angle > 0 and not np.iscomplex(s_angle):
-                    match_vals.append(s_angle)
-    if match_count <= 0:
-        logger.log(
-            logging.WARN,
-            "No angles in the structures match parameter atom types for parameter: "
-            + str(param),
-        )
-        return None
-    else:
-        if len(match_vals) == 0:
-            logger.log(
-                logging.WARNING,
-                "WARNING: All structures with interactions matching parameter {} have invalid estimates so it will not be changed. Please review normal modes.".format(
-                    param
-                ),
-            )
-            return None
-
-        averaged_fc = sum([float(fc) for fc in match_vals]) / match_count
-        return averaged_fc
+def derive_bf_param(param, structs, hessians, ang_to_bohr=True, scaling=0.963):
+    """Mean valid bond curvature in Hartree/Bohr^2, before FF conversion."""
+    return _derive_force_constant(param, structs, hessians, "bonds", ang_to_bohr, scaling)
 
 
-def average_ae_param(param: Param, structs: List[Structure]) -> float:
-    """Returns averaged angle for param.
+def derive_af_param(param, structs, hessians, ang_to_bohr=True, scaling=0.963):
+    """Mean valid angular curvature in Hartree/rad^2, using lengths in Bohr."""
+    return _derive_force_constant(param, structs, hessians, "angles", ang_to_bohr, scaling)
 
-     Averages the equilibrium angle value of the parameter based on the structures given,
-     matching the structure's angles to the force field parameter by atom type matching and then
-     averaging over the angles measured for each angle which matches the force field parameter.
 
-    Args:
-        param (Param): equilibrium angle parameter to estimate
-        structs (List[Structure]): structures (in Angstroms) to use in averaging.
-
-    Returns:
-        float: average angle equilibrium value (degrees)
-    """
-    # It is necessary to average over multiple bonds in the structure which match
-    # to the same atom type interactions in the force field.
-    match_count = 0
-    match_vals = []
+def _average_equilibrium(param, structs, kind):
+    values = []
     for struct in structs:
-        type_dict = struct.get_DOF_atom_types_dict()
-        for angle in struct.angles:
-            if (
-                utilities.is_same_type_DOF(param.atom_types, type_dict[angle]) #TODO if this works properly for amber, then need to move type_dict to per structure basis outside this module passed into this method
-            ):
-                match_count += 1
-                match_vals.append(angle.value)
-    if match_count <= 0:
-        logger.log(
-            logging.WARN,
-            "No angles in the structures match parameter atom types for parameter: "
-            + str(param),
-        )
-        return param.value
-    else:
-        averaged_angle = sum([float(angl) for angl in match_vals]) / match_count
-        return averaged_angle
+        types = struct.get_DOF_atom_types_dict()
+        for dof in getattr(struct, kind):
+            if _matches_param(param, dof, types) and np.isfinite(dof.value):
+                values.append(dof.value)
+    return float(np.mean(values)) if values else param.value
 
 
-def average_be_param(param: Param, structs: List[Structure]) -> float:
-    """Returns averaged bond length for param.
+def average_ae_param(param, structs):
+    """Mean equilibrium angle in degrees, matched by type or assigned MM3 row."""
+    return _average_equilibrium(param, structs, "angles")
 
-     Averages the equilibrium bond length value of the parameter based on the structures given,
-     matching the structure's bonds to the force field parameter by atom type matching and then
-     averaging over the bonds measured for each bond which matches the force field parameter.
 
-    Args:
-        param (Param): equilibrium bond parameter to estimate
-        structs (List[Structure]): structures (in Angstroms) to use in averaging.
+def average_be_param(param, structs):
+    """Mean equilibrium bond length in Angstrom, independent of Bohr projection."""
+    return _average_equilibrium(param, structs, "bonds")
 
-    Returns:
-        float: average bond length equilibrium value (Angstrom)
+
+def prepare_hessian(hessian, atoms, hessian_units=co.GAUSSIAN,
+                    reverse=False, invert=None):
+    """Return an unweighted Cartesian Hessian in Hartree/Bohr^2.
+
+    reverse=True declares a mass-weighted input (amu). Inversion temporarily
+    uses mass-weighted AU/amu, while its supplied replacement has RDAT's
+    kJ/(mol*A^2*amu) units. Neither operation changes output FF conventions.
     """
-    # It is necessary to average over multiple bonds in the structure which match
-    # to the same atom type interactions in the force field.
-    match_count = 0
-    match_vals = []
-    for struct in structs:
-        type_dict = struct.get_DOF_atom_types_dict()
-        for bond in struct.bonds:
-            if (
-                utilities.is_same_type_DOF(param.atom_types, type_dict[bond]) #TODO this works properly for amber, so need to move type_dict to per structure basis outside this module passed into this method
-            ):  
-                match_count += 1
-                match_vals.append(bond.value)
-    if match_count <= 0:
-        logger.log(
-            logging.WARN,
-            "No bonds in the structure match parameter atom types for parameter: "
-            + str(param),
-        )
-        return param.value
+    hessian = np.array(hessian, dtype=float, copy=True)
+    if hessian.shape != (3 * len(atoms), 3 * len(atoms)):
+        raise ValueError("Hessian dimensions do not match the reference atoms.")
+    if not np.isfinite(hessian).all() or not np.allclose(
+            hessian, hessian.T, rtol=1e-8, atol=1e-10):
+        raise ValueError("Hessian must be finite and symmetric.")
+    if hessian_units == co.KJMOLA:
+        hessian /= co.HESSIAN_CONVERSION
+    elif hessian_units != co.GAUSSIAN:
+        raise ValueError("Hessian units must be AU or KJMOLA.")
+    if reverse or invert is not None:
+        try:
+            masses = np.array([co.MASSES[atom.element] for atom in atoms])
+        except KeyError as error:
+            raise ValueError("Unknown atomic mass: {}".format(error)) from error
+        if not np.isfinite(masses).all() or np.any(masses <= 0):
+            raise ValueError("Mass weighting requires positive atomic masses in amu.")
+        sqrt_mass = np.repeat(np.sqrt(masses), 3)
+        mass_matrix = np.outer(sqrt_mass, sqrt_mass)
+        if reverse:
+            hessian *= mass_matrix
+        if invert is not None:
+            if not np.isfinite(invert) or invert <= 0:
+                raise ValueError("Inversion eigenvalue must be finite and positive.")
+            mw = hessian / mass_matrix
+            values, vectors = np.linalg.eigh(mw)
+            # About 5 cm^-1: ignore tiny numerical curvatures when checking
+            # that inversion has a negative direction to act on.
+            significant = values < -1e-6
+            count = np.count_nonzero(significant)
+            if not count:
+                raise ValueError("TS inversion needs a significant negative eigenvalue.")
+            if count > 1:
+                logger.warning("Hessian has %s significant negative eigenvalues; replacing only the lowest and retaining the others.", count)
+            values[0] = invert / co.HESSIAN_CONVERSION
+            hessian = (vectors @ np.diag(values) @ vectors.T) * mass_matrix
+    return hessian
 
-    else:
-        averaged_bond = sum([float(length) for length in match_vals]) / match_count
-        return averaged_bond
 
-# endregion AMBER
+def curvature_to_parameter(value, ptype, force_field):
+    """Convert AU curvature to a native coefficient, after projection.
 
-# endregion Estimators & Averagers
-
-def amber_qfuerza(
-    force_field: FF,
-    structures: List[Structure],
-    hessians: List[np.ndarray],
-    zero_out: bool,
-    hessian_units=co.GAUSSIAN,
-    skip_dummy: bool = False,
-) -> FF:
-    """Returns a FF with Seminario/FUERZA-estimated force constant and averaged equilibrium structure parameters.
-
-    Args:
-        force_field (FF): FF for which to estimate new parameters.
-        structures (List[Structure]): structures for which to estimate new FF(s) in Angstrom, degrees
-        hessians (np.ndarray): Hessian matrices (Cartesian), units assumed to be in kJ mol**-1 Ang**-2. If otherwise, specify unit
-        system with hessian_units constant from constants.py. List must be in same order as structures.
-        zero_out (bool): Whether to zero out parameter values for bond dipoles/charges and torsional parameters.
-        hessian_units (str): Hessian matrix units, Defaults to Atomic Units (AU) with co.GAUSSIAN.
-
-    Note:
-        Hessian is the 2nd derivative of potential energy surface of structure calculated
-        at the electronic structure level of theory or above to serve as a quantum-level reference of TS dynamics.
-        AMBER is weird and scales the force constants a bit. In AMBER, v=0.5k(l-l0) so need to multiply FC estimate by 0.5
-
-    Returns:
-        FF: FF with parameters estimated via Seminario/FUERZA and averaged over structural values.
+    The Bohr/Angstrom conversion is dimensional. Amber's separate 1/2
+    follows E=K*dq^2, whereas the projected curvature is d2E/dq2. MM3*
+    instead uses its own STR/BND header factors, with no extra Amber 1/2.
     """
+    if ptype not in ("bf", "af"):
+        raise ValueError("Only bond and angle curvatures can be converted.")
+    dimensional = (co.HESSIAN_CONVERSION if ptype == "bf"
+                   else co.HARTREE_TO_KJMOL)
+    curvature_kj = value * dimensional
+    if force_field.units == co.AMBERFF:
+        return 0.5 * curvature_kj * co.HARTREE_TO_KCALMOL / co.HARTREE_TO_KJMOL
+    if force_field.units == co.MM3FF:
+        return curvature_kj / force_field.curvature_factors[ptype]
+    raise ValueError("Unsupported force field.")
+
+
+def _estimate_force_field(force_field, structures, hessians, zero_out=False,
+                          hessian_units=co.GAUSSIAN, skip_dummy=False,
+                          reverse=False, invert=None, scaling=0.963):
+    if not structures or len(structures) != len(hessians):
+        raise ValueError("Each structure must have one Hessian.")
+    if not np.isfinite(scaling) or scaling <= 0:
+        raise ValueError("Curvature scale must be finite and positive.")
+    hessians = [prepare_hessian(h, s.atoms, hessian_units, reverse, invert)
+                for s, h in zip(structures, hessians)]
     estimated_ff = copy.deepcopy(force_field)
-    structs = structures
-
-    ang_to_bohr = hessian_units == co.GAUSSIAN
-    #hessians = [datatypes.mass_weight_hessian(hessian, structs[0].atoms, reverse=True)  for hessian in hessians] #TODO TESTING THIS MF
+    n_estimated = 0
     for param in estimated_ff.params:
-        if param.ptype == "be":
-            param.value = average_be_param(param, structs)
-
-        elif param.ptype == "ae":
-            param.value = average_ae_param(param, structs)
-            # NOTE: user must make sure mol2 structure is the same as gaussian log or fchk structure (just in IRC)
-
-        elif zero_out and (param.ptype == "df" or param.ptype == "q"):
-            param.value = 0.0
-
-        elif skip_dummy and "D1" in param.atom_types:
+        if skip_dummy and (any(t in ("D1", "Du", "X") for t in param.atom_types)
+                           or _has_dummy_match(param, structures)):
             continue
-
-        elif param.ptype == "bf":
-            est_bf = derive_bf_param(
-                param=param, structs=structs, hessians=hessians, ang_to_bohr=ang_to_bohr
-            )
-            if est_bf: param.convert_and_set(0.5*est_bf)
-
-        elif param.ptype == "af":
-            est_af = derive_af_param(param, structs, hessians, ang_to_bohr=ang_to_bohr)
-            if est_af: param.convert_and_set(est_af)
-
-    return estimated_ff
-
-def amber_raw_fuerza(
-    force_field: FF,
-    structures: List[Structure],
-    hessians: List[np.ndarray],
-    zero_out: bool,
-    hessian_units=co.GAUSSIAN,
-    skip_dummy: bool = False,
-) -> FF:
-    """Returns a FF with Seminario/FUERZA-estimated force constant and averaged equilibrium structure parameters.
-
-    Args:
-        force_field (FF): FF for which to estimate new parameters.
-        structures (List[Structure]): structures for which to estimate new FF(s) in Angstrom, degrees
-        hessians (np.ndarray): Hessian matrices (Cartesian), units assumed to be in kJ mol**-1 Ang**-2. If otherwise, specify unit
-        system with hessian_units constant from constants.py. List must be in same order as structures.
-        zero_out (bool): Whether to zero out parameter values for bond dipoles/charges and torsional parameters.
-        hessian_units (str): Hessian matrix units, Defaults to Atomic Units (AU) with co.GAUSSIAN.
-
-    Note:
-        Hessian is the 2nd derivative of potential energy surface of structure calculated
-        at the electronic structure level of theory or above to serve as a quantum-level reference of TS dynamics.
-        AMBER is weird and scales the force constants a bit. In AMBER, v=0.5k(l-l0) so need to multiply FC estimate by 0.5
-
-    Returns:
-        FF: FF with parameters estimated via Seminario/FUERZA and averaged over structural values.
-    """
-    estimated_ff = copy.deepcopy(force_field)
-    structs = structures
-
-    ang_to_bohr = hessian_units == co.GAUSSIAN
-    #hessians = [datatypes.mass_weight_hessian(hessian, structs[0].atoms, reverse=True)  for hessian in hessians] #TODO TESTING THIS MF
-    for param in estimated_ff.params:
         if param.ptype == "be":
-            param.value = average_be_param(param, structs)
-
+            param.value = average_be_param(param, structures)
         elif param.ptype == "ae":
-            param.value = average_ae_param(param, structs)
-            # NOTE: user must make sure mol2 structure is the same as gaussian log or fchk structure (just in IRC)
-
-        elif zero_out and (param.ptype == "df" or param.ptype == "q"):
+            param.value = average_ae_param(param, structures)
+        elif zero_out and param.ptype in ("df", "q"):
             param.value = 0.0
-
-        elif skip_dummy and "D1" in param.atom_types:
-            continue
-
-        elif param.ptype == "bf":
-            est_bf = derive_bf_param(
-                param=param, structs=structs, hessians=hessians, ang_to_bohr=ang_to_bohr
-            )
-            if est_bf: param.convert_and_set(0.5*est_bf)
-
-        elif param.ptype == "af":
-            est_af = derive_af_param(param, structs, hessians, ang_to_bohr=ang_to_bohr)
-            if est_af: param.convert_and_set(est_af)
-
+        elif param.ptype in ("bf", "af"):
+            derive = derive_bf_param if param.ptype == "bf" else derive_af_param
+            value = derive(param, structures, hessians, ang_to_bohr=True,
+                           scaling=scaling)
+            if value is not None:
+                param.value = curvature_to_parameter(value, param.ptype, force_field)
+                n_estimated += 1
+    if not n_estimated:
+        raise ValueError("No valid matched force constants; check atom types, MMO FF rows and Hessians.")
     return estimated_ff
 
 
-# region Stand-alone Seminario/FUERZA methods process
+def amber_qfuerza(force_field, structures, hessians, zero_out=False,
+                   hessian_units=co.GAUSSIAN, skip_dummy=False,
+                   reverse=False, invert=None, scaling=0.963):
+    return _estimate_force_field(force_field, structures, hessians, zero_out,
+                                 hessian_units, skip_dummy, reverse, invert, scaling)
 
 
-def main(args):
-    if sys.version_info > (3, 0):
-        if isinstance(args, str):
-            args = args.split()
-    else:
-        if isinstance(args, basestring):
-            args = args.split()
+def mm3_qfuerza(force_field, structures, hessians, zero_out=False,
+                 hessian_units=co.GAUSSIAN, skip_dummy=False,
+                 reverse=False, invert=None, scaling=0.963):
+    return _estimate_force_field(force_field, structures, hessians, zero_out,
+                                 hessian_units, skip_dummy, reverse, invert, scaling)
+
+
+# Kept for callers of the old API; both use the original projection.
+amber_raw_fuerza = amber_qfuerza
+
+
+def _expand_paths(paths):
+    result = []
+    for pattern in paths:
+        found = sorted(glob.glob(pattern))
+        if not found:
+            raise ValueError("No files match: {}".format(pattern))
+        result.extend(found)
+    return result
+
+
+def _use_reference_geometry(structure, reference):
+    """Use exact QM coordinates after checking atom order and orientation."""
+    source = np.array([a.coords for a in structure.atoms], dtype=float)
+    target = np.array([a.coords for a in reference.atoms], dtype=float)
+    if source.shape != target.shape or not np.isfinite(source).all():
+        raise ValueError("Structure and Gaussian reference have different atoms/coordinates.")
+    if not np.allclose(source - source.mean(axis=0), target - target.mean(axis=0),
+                       atol=1e-3, rtol=0):
+        raise ValueError("{} is not in the Gaussian archive's atom order and frame."
+                         .format(structure.origin_name))
+    for atom, qm_atom in zip(structure.atoms, reference.atoms):
+        atom.coords = qm_atom.coords.copy()
+        atom._element = qm_atom.element
+    for bond in structure.bonds:
+        a, b = structure.get_atoms_in_DOF(bond)
+        bond.value = math_util.measure_bond(a.coords, b.coords)
+    for angle in structure.angles:
+        a, b, c = structure.get_atoms_in_DOF(angle)
+        u, v = a.coords - b.coords, c.coords - b.coords
+        norm = np.linalg.norm(u) * np.linalg.norm(v)
+        angle.value = np.degrees(np.arccos(np.clip(np.dot(u, v) / norm, -1, 1))) if norm else np.nan
+
+
+def main(args=None):
+    if isinstance(args, str):
+        args = shlex.split(args)
     parser = return_params_parser()
-    args = parser.parse_args()
-
-    assert (
-        args.ff_in
-    ), "Input force field file is required! Please also verify compatibility/sufficiency of parameters."
-
-    assert (args.mol and args.log), "Both a .mol2 structure file and a Gaussian .log (reference Cartesian Hessian) file are needed!"
-
-    if args.ff_in[-7:] == ".frcmod":
-        ff_in = utilities.AmberUtilities.read_frcmod(args.ff_in)
-        logger.log(logging.INFO, "amber ff imported: {}".format(ff_in.path))
-    else:
-        raise NotImplemented()
-
-    if args.mol and "*" in args.mol[0]:
-        args.mol = sorted(glob.glob(args.mol[0]))
-
-
-    structs: List[Structure] = []
-
-    if args.mol:
-        struct_files: List[Mol2] = [Mol2(mol_path) for mol_path in args.mol]
-        logger.log(
-            logging.INFO,
-            "{}/{} Mol2 structure files imported.".format(
-                len(struct_files), len(args.mol)
-            ),
-        )
-
-    for struct in struct_files:
-        structs.extend(struct.structures)
-    logger.log(
-        logging.INFO, "{} Structures imported from mol2 files.".format(len(structs))
-    )
-
-    if args.log:
-        if "*" in args.log[0]:
-            args.log = sorted(glob.glob(args.log[0]))
-        assert len(structs) == len(
-            args.log
-        ), "Gaussian log input must have 1:1 correspondence with the input structures."
-    elif args.mm_log:
-        if "*" in args.mm_log[0]:
-            args.mm_log = sorted(glob.glob(args.mm_log[0]))
-        assert len(structs) == len(
-            args.mm_log
-        ), "MM log input must have 1:1 correspondence with the input structures."
-
-    if (
-        args.log
-    ):  # Hess is converted from au to kJ/molA, archive and fchk H not mass-weighted.
-        # NOTE: If Hessian gets mass-weighted, then the resulting force constants must be un-massweighted.
-        # The code for this is left in but commented out for now in case a reason arrives to mass-weight.
-        logs: List[GaussLog] = [GaussLog(log, au_hessian=False) for log in args.log]
-        logger.log(
-            logging.INFO,
-            "{}/{} Gaussian log files imported.".format(len(logs), len(args.log)),
-        )
-        hessians: List[np.ndarray] = []
-        for log in logs:
-            #TODO MF the below line is added bc sometimes it reads the archive hessian, sometimes it's None
-            #No clue what Eric did with this but it makes no sense and is unnecessarily complicated.
-            #We always need the Hessian data unless we are fitting charges or lengths, Hessian I/O is never
-            #that bad so we should just read it in at this point cus this is ridiculous. Also, elements should be
-            #protected in a consistent manner, sometimes hessian is sometimes it isn't? And they should always be
-            #validated before moving on... The below line is ideally just a temporary fix for reworking this.
-            if log.structures[-1].hess is None:
-                log.read_archive()
-            mw_hessian = copy.deepcopy(log.structures[-1].hess) #converted to KJMOLA on creation
-            # evals = log.evals
-            # evecs = log.evecs
-            # mw_hessian = reform_hessian(evals, evecs)
-            # mass_weight_hessian(mw_hessian, log.structures[-1].atoms)
-            if args.invert:
-                mw_hessian = invert_ts_curvature(mw_hessian)
-                logger.log(
-                    logging.INFO, "Inverted Hessian from {}...".format(log.filename)
-                )
-            hessians.append(copy.deepcopy(mw_hessian))
-        logger.log(
-            logging.INFO,
-            "{}/{} Hessians imported.".format(len(hessians), len(args.log)),
-        )
-
-    assert len(structs) == len(
-        hessians
-    ), "Hessians and Structures must match 1:1 in corresponding order. Uneven numbers imported, likely due to multiple entries in one file but not its corresponding file."
-
-    if args.individualize:
-        for i in range(len(structs)):
-
-            if isinstance(ff_in, AmberFF):
-                estimated_ff = amber_qfuerza(
-                    ff_in,
-                    [structs[i]],
-                    [hessians[i]],
-                    args.prep,
-                    skip_dummy=args.skip_dummy,
-                )
-            else:
-                raise NotImplemented()
-            # Write out new FF
-            utilities.AmberUtilities.write_frcmod( #TODO: MF - this should be in the masterclass FF, just an abstract method...
-                estimated_ff, structs[i].origin_name + "." + args.ff_out, estimated_ff.params
-            )
-    else:
-        if isinstance(ff_in, AmberFF):
-            estimated_ff = amber_qfuerza(
-                ff_in,
-                structs,
-                hessians,
-                args.prep,
-                skip_dummy=args.skip_dummy,
-            )
+    args = parser.parse_args(args)
+    try:
+        if args.ff_in.endswith(".frcmod"):
+            if not args.mol:
+                raise ValueError("Amber .frcmod input requires --mol.")
+            ff = utilities.AmberUtilities.read_frcmod(args.ff_in)
+            if not ff.params:
+                raise ValueError("No # Q2MM / OPT parameters in the frcmod.")
+            structures = [s for path in _expand_paths(args.mol) for s in Mol2(path).structures]
+        elif args.ff_in.endswith(".fld"):
+            if not args.mmo:
+                raise ValueError("MM3* .fld input requires --mmo for exact FF Line assignments.")
+            ff = utilities.MM3Utilities.read_fld(args.ff_in)
+            structures = [s for path in _expand_paths(args.mmo)
+                          for s in utilities.MM3Utilities.read_mmo(path)]
+            for struct in structures:
+                for kind, dofs in (("1", struct.bonds), ("2", struct.angles)):
+                    for dof in dofs:
+                        if not (1 <= dof.ff_row <= len(ff.lines)) or ff.lines[dof.ff_row-1][1:2] != kind:
+                            raise ValueError("MMO FF Line {} does not match this .fld file."
+                                             .format(dof.ff_row))
         else:
-            raise NotImplemented()
-        
+            raise ValueError("Input force field must be .frcmod (Amber) or .fld (MM3*).")
+        logs = [GaussLog(path, au_hessian=True) for path in _expand_paths(args.log)]
+        if len(logs) != len(structures):
+            raise ValueError("Supply one Gaussian log for each structure.")
+        if args.reverse and not args.hessian:
+            raise ValueError("Gaussian archive Hessians are unweighted; --reverse requires --hessian matrix input.")
+        if not args.hessian and args.hessian_units != co.GAUSSIAN:
+            raise ValueError("--hessian-units applies only to --hessian matrix files.")
+        hessians = []
+        for struct, log in zip(structures, logs):
+            reference = log.structures[-1]
+            _use_reference_geometry(struct, reference)
+            hessians.append(reference.hess)
+        if args.hessian:
+            paths = _expand_paths(args.hessian)
+            if len(paths) != len(structures):
+                raise ValueError("Supply one --hessian matrix per structure.")
+            hessians = [np.load(path, allow_pickle=False) if path.endswith(".npy")
+                        else np.loadtxt(path) for path in paths]
+        elif any(h is None for h in hessians):
+            raise ValueError("Gaussian log does not contain an archive Hessian.")
+        estimate = amber_qfuerza if isinstance(ff, AmberFF) else mm3_qfuerza
+        if args.raw_fuerza:
+            logger.info("Using original Seminario/FUERZA projections (no empirical H-angle substitution).")
+        groups = [([s], [h]) for s, h in zip(structures, hessians)] if args.individualize else [(structures, hessians)]
+        outputs = []
+        for index, (structs, matrices) in enumerate(groups, 1):
+            estimated = estimate(ff, structs, matrices, args.prep,
+                                 hessian_units=args.hessian_units,
+                                 skip_dummy=args.skip_dummy, reverse=args.reverse,
+                                 invert=args.invert, scaling=args.scale)
+            path = args.ff_out
+            if args.individualize:
+                directory, name = os.path.split(path)
+                path = os.path.join(directory, "{}.{}".format(index, name))
+            if isinstance(estimated, AmberFF):
+                # Do not let the shared writer silently retain old values.
+                if any(not np.isfinite(p.value) or abs(p.value) > 1999 for p in estimated.params):
+                    raise ValueError("Estimated Amber parameter is nonfinite or exceeds the writer's 1999 limit.")
+                utilities.AmberUtilities.write_frcmod(estimated, path, estimated.params)
+            else:
+                utilities.MM3Utilities.write_fld(estimated, path)
+            outputs.append(path)
+        return outputs
+    except (ValueError, OSError, IndexError) as error:
+        parser.error(str(error))
 
-        # Write out new FF
-        utilities.AmberUtilities.write_frcmod(estimated_ff, args.ff_out, estimated_ff.params)
-
-
-# endregion
 
 if __name__ == "__main__":
-    logging.config.dictConfig(co.LOG_SETTINGS)
-    main(sys.argv[1:])
+    main()

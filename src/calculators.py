@@ -9,6 +9,7 @@ is the universal language on both sides of this module.
 
     Calculator          abstract engine interface
     AmberCalculator     runs tleap / sander / cpptraj / nab for one system
+    MacroModelCalculator  placeholder for future MacroModel support
     CalculatorGroup     several calculators driven as one (several .in files)
 
 A Calculator does three things, which can also be run one at a time:
@@ -674,6 +675,16 @@ class AmberCalculator(Calculator):
             return []
         return datums_from_geometry(AmberUtilities.read_geometry(geo_path).structures,
                                     kind, self.src_name)
+
+
+class MacroModelCalculator(Calculator):
+    """Placeholder for future MacroModel execution support."""
+
+    # TODO: Implement update_ff using utilities.MM3Utilities.write_fld.
+    # TODO: Implement calculate to prepare inputs, run MacroModel, and report failures.
+    # TODO: Implement gather_results using MM3Utilities readers and Datum objects.
+    # TODO: Implement clone_into to isolate files for parallel evaluations.
+    # TODO: Set ff_type = MM3FF after these abstract methods are implemented.
 
 
 class CalculatorGroup(Calculator):

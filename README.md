@@ -227,24 +227,97 @@ python -m unittest discover -s tests -v
 
 ## Seeding force constants — `qfuerza.py`
 
-Estimates bond and angle force constants from a QM Hessian
-(Seminario/FUERZA), giving the optimizer a far better starting point than
-generic GAFF analogues:
+Estimates bond and angle force constants from a QM Hessian with the
+Seminario/FUERZA projection. The calculation uses **unweighted Cartesian
+Hessians in Hartree/Bohr² and bond lengths in Bohr**. Gaussian archives are
+read in atomic units. Geometry files remain in Å; their bond lengths are
+converted to Bohr for projection. Equilibrium geometry is measured from
+the Gaussian archive and written in Å and degrees.
+
+For Amber:
 
 ```bash
 python src/qfuerza.py -i MOL.frcmod -o MOL_seeded.frcmod \
-                      -m MOL.mol2 -gl MOL.log --invert
+                      -m MOL.mol2 -gl MOL.log --invert 4500
 ```
+
+Omit `--invert` for a minimum or for projections from the original TS
+Hessian. The replacement value uses the same units as `RDAT -gh -i`:
+**kJ/(mol·Å²·amu)**. The code temporarily mass weights the Hessian, replaces
+one significant negative eigenvalue, and removes the weighting before
+projection. Other eigenvalues are retained. A minimum is rejected when
+inversion is requested; additional significant negative eigenvalues are
+reported and retained, rather than silently zeroed.
+
+For MM3*, supply a MacroModel `.mmo` listing generated using the **same
+`.fld` file**, including coordinates (`DEBG 56`) and bond/angle `FF Line`
+assignments:
+
+```bash
+python src/qfuerza.py -i mm3.fld -o mm3_seeded.fld \
+                      --mmo MOL.mmo -gl MOL.log --invert 4500
+```
+
+MM3* interactions are matched by assigned FF row. This preserves separate
+parameters for environments such as cis and trans angles with identical
+atom types. The reader edits OPT bond/angle records and preserves other
+MM3* records. It reads text files without a Schrödinger Python dependency;
+MacroModel is needed to produce the assigned `.mmo` listing.
+
+Unit conversion and force-field energy conventions are separate:
+
+| Output | Bond coefficient from projected curvature κr | Angle coefficient from projected curvature κθ |
+|---|---|---|
+| Amber | κr × Hartree-to-kcal / Bohr-to-Å² **÷ 2** | κθ × Hartree-to-kcal **÷ 2** |
+| MM3* | κr × Hartree-to-kJ / Bohr-to-Å² ÷ native `STR` factor | κθ × Hartree-to-kJ ÷ native `BND` factor |
+
+Amber's factor **½** follows its energy expression `E = K(Δq)²`. It is
+independent of the Bohr/Å conversion. MM3* uses its own header conversion
+factors (normally 601.99392), with no additional Amber factor. No scalar
+mass factors are applied to the projected constants.
+
+To supply an already mass-weighted Hessian, use a full `3N × 3N` matrix in
+NumPy `.npy` format or whitespace-delimited text, and declare `--reverse`:
+
+```bash
+python src/qfuerza.py -i MOL.frcmod -o MOL_seeded.frcmod \
+                      -m MOL.mol2 -gl MOL.log \
+                      --hessian Hmw.npy --hessian-units KJMOLA --reverse
+```
+
+Here `KJMOLA` means kJ/(mol·Å²·amu) for a weighted matrix. For
+Hartree/(Bohr²·amu), use `--hessian-units AU` (the default). Weighting must
+use the atomic masses in `src/constants.py`'s `MASSES` table, in amu, as in
+the fitting code. The **full matrix** is unweighted before projection.
+`--reverse` and `--invert VALUE` can be combined. Standard Gaussian archive
+Hessians are unweighted, so `--reverse` requires explicit `--hessian` input.
+The Gaussian log still supplies reference geometry and element identities.
+
+Structures and matrices must have the same atom order and Cartesian frame
+as the Gaussian archive. Counts and coordinates are checked; a rotation or
+reordering needs to be resolved before running this command. A supplied
+matrix must already be expressed in that frame. For a TS MOL2, include the
+forming bond if its parameters and associated angles are to be estimated.
 
 | flag | meaning |
 |---|---|
-| `-i` / `-o` | input / output force field |
-| `-m` | mol2 structure(s) |
-| `-gl` / `-gf` / `-ml` | Gaussian `.log` / Gaussian `.fchk` / MacroModel `.log` Hessian |
-| `--invert` | invert the Hessian curvature for a transition state |
-| `--prep` | also zero bond dipoles/charges and torsion terms `V1–V3` |
-| `--raw-fuerza` | plain FUERZA, without the QFUERZA correction |
-| `--individualize` | one force field per structure instead of an average |
+| `-i` / `-o` | required input / output force field |
+| `-m` / `--mmo` | Amber MOL2 / assigned MM3* MMO structure(s) |
+| `-gl` | Gaussian `.log` archive(s), one per structure |
+| `--hessian` | optional full matrix file(s), replacing archive matrices |
+| `--hessian-units` | matrix units: `AU` or `KJMOLA`; per amu with `--reverse` |
+| `--reverse` | declare a mass-weighted matrix input and remove its weighting |
+| `--invert VALUE` | replace the mass-weighted TS eigenvalue, in RDAT units |
+| `--scale` | curvature/energy scaling factor, default 0.963 |
+| `--prep` | zero selected torsions and MM3* bond dipoles; retain MOL2 charges |
+| `--raw-fuerza` | legacy alias for the same original Seminario/FUERZA projection |
+| `--individualize` | write `1.<output>`, `2.<output>`, etc. in the output directory |
+
+The empirical light terminal atom angle substitution from the QFUERZA
+paper is not implemented here. Invalid or unmatched projections retain
+their input parameters with a warning; accepted projections are averaged
+over valid estimates only. Output is rejected if an estimated Amber value
+would exceed the shared writer's 1999 limit and otherwise be skipped.
 
 Adapted in part from [Samuel Genheden's Seminario
 implementation](https://github.com/SGenheden/Seminario).

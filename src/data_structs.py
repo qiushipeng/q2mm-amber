@@ -1215,6 +1215,38 @@ class FF(object):
         raise NotImplemented
 
 
+# region MM3*
+
+
+class MM3Param(Param):
+    """An MM3* parameter and its assigned .fld row and numeric column."""
+
+    def __init__(self, atom_types, ptype, ff_row, ff_col, value):
+        self.atom_types = atom_types
+        self.ff_row = ff_row
+        self.ff_col = ff_col
+        super().__init__(ptype=ptype, value=value)
+
+
+class MM3FF(FF):
+    """MM3* parameters, template lines, and native STR/BND factors.
+
+    File operations are handled by utilities.MM3Utilities.
+    """
+
+    units = co.MM3FF
+
+    def __init__(self, path, lines, params, curvature_factors):
+        super().__init__(path=path, params=params)
+        self.lines = lines
+        # The STR/BND factors convert native coefficients to harmonic
+        # curvatures in kJ/mol/A^2 and kJ/mol/rad^2, respectively.
+        self.curvature_factors = curvature_factors
+
+
+# endregion MM3*
+
+
 # region AMBER
 
 

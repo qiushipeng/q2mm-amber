@@ -15,7 +15,8 @@ from typing import List
 #import parmed
 
 import constants as co
-from data_structs import AmberFF, Angle, Atom, Bond, Datum, ParAMBER, Structure, Torsion
+from data_structs import (AmberFF, Angle, Atom, Bond, Datum, MM3FF, MM3Param,
+                          ParAMBER, Structure, Torsion)
 from math_util import measure_bond
 
 config.dictConfig(co.LOG_SETTINGS)
@@ -288,11 +289,9 @@ class Mol2(File):
             if atom_entry == "" or atom_entry.strip() == self.ATOM_FLAG:
                 continue
             atom_split = atom_entry.split()
-            for chr in atom_split[1]:
-                if chr.isdigit():
-                    numer_index = atom_split[1].index(chr)
-                    break
-            element = atom_split[1][0:numer_index] if numer_index else atom_split[1]
+            numer_index = next((i for i, char in enumerate(atom_split[1])
+                                if char.isdigit()), len(atom_split[1]))
+            element = atom_split[1][:numer_index] or atom_split[1]
             atoms.append(
                 Atom(
                     index=int(atom_split[0]),
@@ -1241,6 +1240,155 @@ class GaussLog(File):
         return structures
 
 #endregion Reference Files
+
+#region MM3* I/O
+
+class MM3Utilities(object):
+    """MM3* file I/O for native .fld parameters and assigned .mmo geometry.
+
+    OPT parameters are editable; other file text and FF-row numbers are
+    retained. MMO assignments distinguish interactions with identical atom
+    types. These readers do not require a Schrodinger Python installation.
+    Engine execution belongs in calculators.MacroModelCalculator.
+    """
+
+    _NUMBER = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[EeDd][-+]?\d+)?"
+    _ATOM = re.compile(r"^\s*(\S+)\s+\(\s*(\d+)\)\s+" +
+                       r"\s+".join(["(" + _NUMBER + ")"] * 5))
+
+    @staticmethod
+    def read_fld(path):
+        """Read OPT records, preserving MM3* row numbers and fixed columns."""
+        with open(path) as handle:
+            lines = handle.readlines()
+        params = []
+        factors = {}
+        in_opt = False
+        for row, line in enumerate(lines, 1):
+            fields = line.split()
+            if len(fields) >= 4 and fields[0] == "0" and fields[1] in ("STR", "BND"):
+                if fields[2] != "3":
+                    raise ValueError("MM3* STR/BND must use the native MM3 function (3).")
+                factors["bf" if fields[1] == "STR" else "af"] = float(fields[3])
+            if line.startswith(" C"):
+                # A comment inside an OPT substructure does not close it.
+                if "OPT" in line:
+                    in_opt = True
+                continue
+            if line.startswith("-3"):
+                in_opt = False
+                continue
+            if not (in_opt or "OPT" in line):
+                continue
+            if not re.match(r"[ a-z][124]", line):
+                continue
+            kind = line[1]
+            n_atoms = {"1": 2, "2": 3, "4": 4}[kind]
+            # Labels in a substructure can be numeric. They are metadata only:
+            # the MMO's FF Line assignment determines which interaction to fit.
+            labels = [line[4 + 4*i:6 + 4*i].strip() for i in range(n_atoms)]
+            types = {"1": ("be", "bf", "q"), "2": ("ae", "af"),
+                     "4": ("df", "df", "df")}[kind]
+            for col, ptype in enumerate(types, 1):
+                start = 23 + 11 * (col - 1)
+                value = line[start:start + 10].strip()
+                if value:
+                    params.append(MM3Param(labels, ptype, row, col, float(value)))
+        if set(factors) != {"bf", "af"} or any(
+                not np.isfinite(x) or x <= 0 for x in factors.values()):
+            raise ValueError("MM3* file needs positive STR and BND conversion factors.")
+        if not any(p.ptype in ("bf", "af") for p in params):
+            raise ValueError("No OPT bond or angle parameters found in MM3* file.")
+        return MM3FF(path, lines, params, factors)
+
+    @staticmethod
+    def write_fld(ff, path):
+        """Replace selected numeric fields without changing FF-row assignments."""
+        lines = list(ff.lines)
+        for param in ff.params:
+            if not np.isfinite(param.value):
+                raise ValueError("Nonfinite MM3* parameter at row {}.".format(param.ff_row))
+            value = "{:10.4f}".format(param.value)
+            if len(value) != 10:
+                raise ValueError("MM3* parameter does not fit its field at row {}."
+                                 .format(param.ff_row))
+            start = 23 + 11 * (param.ff_col - 1)
+            line = lines[param.ff_row - 1]
+            lines[param.ff_row - 1] = line[:start] + value + line[start + 10:]
+        with open(path, "w") as handle:
+            handle.writelines(lines)
+
+    @classmethod
+    def read_mmo(cls, path):
+        """Read geometry and exact FF Line assignments from MacroModel output.
+
+        The listing must include Atomic Charges, Coordinates and Connectivity
+        (MacroModel DEBG 56). Both Input filename and Input Structure Name
+        markers can occur for the same structure; they must not double-count it.
+        """
+        structures = []
+        n_input = n_name = 0
+        section = None
+        with open(path) as handle:
+            for line in handle:
+                if "Input filename" in line:
+                    n_input += 1
+                elif "Input Structure Name" in line:
+                    n_name += 1
+                if max(n_input, n_name) > len(structures):
+                    structures.append(Structure("{}.{}".format(os.path.basename(path),
+                                                              len(structures) + 1)))
+                    section = None
+                if not structures:
+                    continue
+                struct = structures[-1]
+                if "BOND LENGTHS AND STRETCH ENERGIES" in line:
+                    section = "bond"
+                elif "ANGLES, BEND AND STRETCH BEND ENERGIES" in line:
+                    section = "angle"
+                elif "Atomic Charges, Coordinates and Connectivity" in line:
+                    section = "atoms"
+                elif ("BEND-BEND ANGLES" in line or "DIHEDRAL ANGLES" in line
+                      or "Total QQ" in line):
+                    section = None
+                if section == "atoms":
+                    match = cls._ATOM.match(line)
+                    if match:
+                        typ, index, charge, _, x, y, z = match.groups()
+                        struct.atoms.append(Atom(index=int(index), atom_type_name=typ,
+                                                 coords=[float(v.replace("D", "E"))
+                                                         for v in (x, y, z)],
+                                                 partial_charge=float(charge)))
+                elif section in ("bond", "angle"):
+                    fields = line.split()
+                    n_atoms = 2 if section == "bond" else 3
+                    # Bond actual length is column 5; actual angle is column 7.
+                    actual = 4 if section == "bond" else 6
+                    try:
+                        indices = [int(x) for x in fields[:n_atoms]]
+                        value = float(fields[actual])
+                        row = int(fields[-1])
+                        if len(indices) != n_atoms:
+                            continue
+                    except (ValueError, IndexError):
+                        continue
+                    dof = (Bond if section == "bond" else Angle)(
+                        atom_nums=indices, value=value, ff_row=row)
+                    (struct.bonds if section == "bond" else struct.angles).append(dof)
+        if not structures:
+            raise ValueError("No structures found in MMO file: {}".format(path))
+        for struct in structures:
+            struct.atoms.sort(key=lambda atom: atom.index)
+            if not struct.atoms or [a.index for a in struct.atoms] != list(
+                    range(1, len(struct.atoms) + 1)):
+                raise ValueError("MMO needs ordered coordinates (enable DEBG 56): {}"
+                                 .format(struct.origin_name))
+            if not struct.bonds or not struct.angles:
+                raise ValueError("MMO needs bond and angle FF Line assignments: {}"
+                                 .format(struct.origin_name))
+        return structures
+
+#endregion MM3* I/O
 
 #region AMBER I/O
 
