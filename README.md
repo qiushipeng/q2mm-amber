@@ -303,7 +303,7 @@ forming bond if its parameters and associated angles are to be estimated.
 |---|---|
 | `-i` / `-o` | required input / output force field |
 | `-m` / `--mmo` | Amber MOL2 / assigned MM3* MMO structure(s) |
-| `-gl` | Gaussian `.log` archive(s), one per structure |
+| `-gl` / `--log` | Gaussian `.log` archive(s), one per structure |
 | `--hessian` | optional full matrix file(s), replacing archive matrices |
 | `--hessian-units` | matrix units: `AU` or `KJMOLA`; per amu with `--reverse` |
 | `--reverse` | declare a mass-weighted matrix input and remove its weighting |
@@ -312,6 +312,7 @@ forming bond if its parameters and associated angles are to be estimated.
 | `--prep` | zero selected torsions and MM3* bond dipoles; retain MOL2 charges |
 | `--raw-fuerza` | legacy alias for the same original Seminario/FUERZA projection |
 | `--individualize` | write `1.<output>`, `2.<output>`, etc. in the output directory |
+| `--log-file FILE` | write this run's messages to `FILE` (overwritten) instead of appending them to `root.log`; `FILE` must not be an input or the output |
 
 The empirical light terminal atom angle substitution from the QFUERZA
 paper is not implemented here. Invalid or unmatched projections retain

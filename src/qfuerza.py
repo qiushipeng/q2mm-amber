@@ -377,6 +377,8 @@ def return_params_parser(add_help=True) -> argparse.ArgumentParser:
                         help="Legacy alias: this implementation uses the Seminario/FUERZA projection without empirical H-angle substitution.")
     parser.add_argument("--individualize", action="store_true",
                         help="Write a separate force field for every structure.")
+    parser.add_argument("--log-file", metavar="FILE",
+                        help="Write this run's messages to FILE (overwritten) instead of appending them to root.log.")
     return parser
 
 
@@ -587,6 +589,26 @@ def _expand_paths(paths):
     return result
 
 
+def _log_to_file(args):
+    """Write this run's log to args.log_file (overwritten) instead of root.log.
+
+    Input patterns are expanded first, so the new file cannot join them, and
+    a log path that is also an input or the output is refused.
+    """
+    for name in ("mol", "mmo", "log", "hessian"):
+        if getattr(args, name):
+            setattr(args, name, _expand_paths(getattr(args, name)))
+    files = [args.ff_in, args.ff_out] + [path for name in ("mol", "mmo", "log", "hessian")
+                                         for path in getattr(args, name) or []]
+    if os.path.realpath(args.log_file) in {os.path.realpath(path) for path in files}:
+        raise ValueError("--log-file {} is also an input or output file.".format(args.log_file))
+    with open(args.log_file, "w"):  # a bad path fails here, with its name
+        pass
+    settings = copy.deepcopy(co.LOG_SETTINGS)
+    settings["handlers"]["root_file_handler"].update(filename=args.log_file, mode="w")
+    logging.config.dictConfig(settings)
+
+
 def _use_reference_geometry(structure, reference):
     """Use exact QM coordinates after checking atom order and orientation."""
     source = np.array([a.coords for a in structure.atoms], dtype=float)
@@ -616,6 +638,8 @@ def main(args=None):
     parser = return_params_parser()
     args = parser.parse_args(args)
     try:
+        if args.log_file:
+            _log_to_file(args)
         if args.ff_in.endswith(".frcmod"):
             if not args.mol:
                 raise ValueError("Amber .frcmod input requires --mol.")

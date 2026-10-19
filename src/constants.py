@@ -27,8 +27,9 @@ LOG_SETTINGS = {
             'class': 'logging.StreamHandler', 'formatter': 'basic',
             'level': 20},
         'root_file_handler': {
+            # delay: create root.log at its first message, not at import.
             'class': 'logging.FileHandler', 'filename': 'root.log',
-            'formatter': 'bare', 'level': 20}
+            'formatter': 'bare', 'level': 20, 'delay': True}
             # 'class': 'logging.FileHandler', 'filename': 'root.log',
             # 'formatter': 'basic', 'level': 20}
         },
