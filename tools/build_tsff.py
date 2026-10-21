@@ -616,6 +616,39 @@ def cap_hydrogens(mapping, T, Tadj, G, Gadj):
     return caps
 
 
+def hydrogen_mismatches(mapping, T, Tadj, G, Gadj, exempt=()):
+    """Matched heavy atoms whose hydrogen count the template cannot explain.
+
+    `mapping` is a heavy-atom match (template index -> model index), as
+    match_heavy returns it. A model atom may carry the hydrogens of its
+    template atom plus one cap hydrogen for each template heavy neighbour
+    that the truncation removed (the CH2 that became CH3 in cap_hydrogens).
+    A count outside that range means that the fragment and the named unit
+    differ in protonation state. HIP, HID and HIE share one heavy-atom graph,
+    so the heavy match alone cannot tell them apart.
+
+    Model atoms in `exempt` are skipped: an atom of a [TS_BONDS] pair carries
+    the transferring hydrogen on purpose. Return one (template index, model
+    index, template H, unmapped heavy, model H) tuple per bad atom."""
+    bad = []
+    for t, g in mapping.items():
+        if g in exempt:
+            continue
+        # Hydrogens that the residue itself carries on this atom.
+        template_h = sum(T[x]["elem"] == "H" for x in Tadj[t])
+        # Template heavy neighbours outside the match. The truncation may
+        # replace each of them with exactly one cap hydrogen in the model.
+        unmapped_heavy = sum(T[x]["elem"] != "H" and x not in mapping
+                             for x in Tadj[t])
+        model_h = sum(G[y]["elem"] == "H" for y in Gadj[g])
+        # Fewer hydrogens: the fragment lacks a proton of the unit (HIP named
+        # for a neutral His). More than the caps explain: the fragment has an
+        # extra proton (HID named for a protonated His).
+        if not template_h <= model_h <= template_h + unmapped_heavy:
+            bad.append((t, g, template_h, unmapped_heavy, model_h))
+    return bad
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -1366,6 +1399,9 @@ def main(argv=None):
     ff19_template_types = {}
     ff19_template_origin = {}
     template_match_counts = []
+    # The hydrogen-count check below skips the atoms of a declared TS bond:
+    # the transferring hydrogen is bonded to them on purpose.
+    ts_bond_atoms = set(idx for pair in ts_bond_roles for idx in pair)
     for library_name, unit, anchor_name in ff19_templates:
         if anchor_name not in names:
             sys.exit("ERROR: ff19SB template anchor '{}' is not an atom in {}"
@@ -1379,6 +1415,29 @@ def main(argv=None):
         if not residue_heavy:
             sys.exit("ERROR: ff19SB template {}:{} did not match the fragment "
                      "anchored at {}".format(library_path, unit, anchor_name))
+        # The heavy-atom match cannot see protonation, so a wrong unit (HIP
+        # for a neutral His, LYS for a neutral Lys) matches cleanly. Then
+        # add_hydrogens pairs the hydrogens by position and silently ignores
+        # a surplus on either side. Stop here instead of typing that unit.
+        mismatches = hydrogen_mismatches(residue_heavy, RT, RTadj, G, Gadj,
+                                         ts_bond_atoms)
+        if mismatches:
+            details = []
+            for t, g, template_h, unmapped_heavy, model_h in mismatches:
+                # A single number when no cap is possible, else the range.
+                expected = str(template_h)
+                if unmapped_heavy:
+                    expected += " to {}".format(template_h + unmapped_heavy)
+                details.append("  {} (template {}): {} H in the mol2, "
+                               "expected {}".format(atom_tokens[g][1],
+                                                    RT[t]["name"], model_h,
+                                                    expected))
+            sys.exit("ERROR: ff19SB template {}:{} anchored at {} does not "
+                     "match the hydrogens of that fragment. Check its "
+                     "protonation state and name the matching unit "
+                     "(HID/HIE/HIP, LYS/LYN, ASP/ASH, GLU/GLH, CYS/CYM):\n{}"
+                     .format(library_path, unit, anchor_name,
+                             "\n".join(details)))
         residue_full = add_hydrogens(residue_heavy, RT, RTadj, G, Gadj)
         residue_types = dict((g, RT[t]["type"])
                              for t, g in residue_full.items())
