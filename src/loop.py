@@ -36,8 +36,9 @@ WGHT <typ> <weight>       Override constants.WEIGHTS[typ] (eg "WGHT b 100.").
 STEP <ptype> <step>       Override constants.STEPS[ptype].
 FXATM <file>              Exclude fixed atoms from the Hessian fit. <file>
                           lists one 1-based atom index per line; Hessian
-                          elements coupling those atoms get weight 0. Put it
-                          before COMP/HYBR so the exclusion is in effect.
+                          elements coupling those atoms get weight 0, and
+                          sander minimizations restrain them. Put it before
+                          CDAT so the restraint is in effect.
 END                       Terminates an inner LOOP block (no-op outside).
 
 Usage
@@ -234,6 +235,9 @@ class Loop(object):
 
             elif cmd == "FXATM":
                 import calculate
+                if self.calculator is not None:
+                    logger.warning("FXATM after CDAT: that CDAT's minimizations did not "
+                                   "restrain the fixed atoms. Put FXATM before CDAT.")
                 calculate.load_fixed_atoms(os.path.join(self.direc, cols[1]))
 
             elif cmd == "END":

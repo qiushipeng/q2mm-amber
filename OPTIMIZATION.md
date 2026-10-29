@@ -133,7 +133,7 @@ directory, and start `loop.py` from it (§8).
 | `MOL.log` | the QM reference (Gaussian frequency job) |
 | `params.txt` | the parameters to fit (§3) |
 | `loop.in` | the command file (§4) |
-| `fixedatoms.txt` | *optional*: the atoms to exclude from the Hessian fit |
+| `fixedatoms.txt` | *optional*: the atoms to exclude from the Hessian fit and to restrain in the minimizations |
 
 A minimal `MOL.in`:
 
@@ -290,7 +290,7 @@ Q2MM runs the commands in order, from top to bottom.
 | `HYBR [opts]` | Hybrid optimizer (§6), inside `LOOP … END`. |
 | `WGHT <typ> <w>` | Change the weight of one data type. |
 | `STEP <ptype> <s>` | Change one differentiation step. |
-| `FXATM <file>` | Exclude fixed atoms from the Hessian fit. |
+| `FXATM <file>` | Exclude fixed atoms from the Hessian fit and restrain them in the minimizations. Put it before `CDAT`. |
 
 `RDAT` and `CDAT` do not use `DIR`. They find their files relative to the
 directory where you start `loop.py`, or relative to their `-d` option. Q2MM
@@ -466,6 +466,15 @@ Q2MM reads ε from the Gaussian logs that `RDAT` and `CDAT` name: `-gh`,
   `Solvent : DiethylEther, Eps= 4.240000`.
 * A log from a job without `SCRF` is a gas-phase reference. Then ε = 1. With
   ε = 1, GB gives the same energies and the same Hessian as Coulomb in vacuum.
+* A gas-phase `opt freq` job is also read as gas phase. Gaussian writes
+  `SCRF=Check` (take the solvent of the checkpoint) in the frequency step that
+  it generates, also when the job has no solvent. When `SCRF=Check` is the only
+  `SCRF` in the log and the log has no PCM block, Q2MM uses ε = 1 and writes
+  this warning:
+
+  ```
+  Thio.log: the only SCRF in its routes is SCRF=Check, which Gaussian adds to the frequency step of an opt+freq job, and the log has no PCM solvent section, so the job is read as gas phase (Eps 1).
+  ```
 * A `CDAT` line without a log, for example `-ah MOL.in`, uses the ε of the
   logs that `RDAT` read.
 
@@ -555,13 +564,28 @@ Upstream Q2MM uses the same weighting. The local bond and angle curvature of
 a constrained atom is still useful information. The constraint contaminates
 mainly the long-range cross-terms of the atom.
 
-Two practical notes:
+`FXATM` also holds the fixed atoms in place in each sander minimization
+(the minimized commands `-abo`, `-aao`, `-ato`, `-aeo` and `-ae1o`; `-ah`
+and `-ageig` also start one), because the QM optimization held them in place
+too. sander restrains them to their `calc/inpcrd` positions (the mol2
+geometry) with `ntr = 1` and 1000 kcal/mol/Å². sander cannot freeze them with
+its belly option, because with GB that option needs the moving atoms first
+in the topology. On a 98-atom theozyme the restrained atoms moved less than
+0.004 Å in 700 cycles (0.53 Å without the restraint), and the minimization
+still converged. The minimized energies are the `EAMBER` value of sander,
+without the restraint energy. The single points (`-ae`, `-ae1`, `-ab`,
+`-aa`, `-at` and the reference `-gabo`/`-gaao`/`-gato`) have no restraint.
 
-* **Position in `loop.in`.** Q2MM applies the exclusion when it calculates a
-  score. Thus `FXATM` can come before or after `CDAT`. It applies to each
-  score that Q2MM calculates after the `FXATM` line. (An earlier version
-  applied it when it built the data. The weights of a `COMP` before and
-  after the command were then different.)
+Three practical notes:
+
+* **Position in `loop.in`.** Put `FXATM` before `CDAT`. Q2MM applies the
+  Hessian exclusion when it calculates a score, so it applies to each score
+  after the `FXATM` line. But Q2MM applies the restraint when it calculates
+  the data. A `CDAT` before `FXATM` minimizes without the restraint, and
+  Q2MM writes a warning.
+* **One set for all structures.** The indices apply to every leap input of
+  the `CDAT` line. Give several systems in one run only if they share the
+  atom numbering of the fixed atoms.
 * **It is optional.** Without the `FXATM` line, Q2MM excludes no atoms. A
   `fixedatoms.txt` file in the directory has no effect by itself. Upstream
   Q2MM reads each file with that name automatically.
@@ -956,4 +980,4 @@ is weak.
 | `-ageig …: … differ by up to … the QM and force-field frames do not match` | The mol2 or the pdb is not in the frame of the normal modes. Usually the frequency job ran without `nosymm`. You then built the mol2 from the archive geometry. There are three solutions (§4, `--modes`). Use `--modes archive` on both lines. Or build the mol2 in the standard orientation of the log. Or run the frequency job again with `nosymm freq=hpmodes`. A pdb from an older mol2 also causes this error. Delete that pdb. |
 | `-ageig … uses --modes …, but -geigz read … with --modes …` | The `RDAT` and `CDAT` lines use different mode sources. Give the same `--modes` on both lines. |
 | `The QM reference logs ran in different media (…)` | The Gaussian logs of `RDAT` and `CDAT` have different `Eps` values, or some logs are gas phase. Use reference logs from one medium (§4, Electrostatics). |
-| `SCRF in the route, but no PCM solvent line with Eps` | The job used a solvent model that Q2MM does not read, for example `SCRF=Dipole`. Use PCM, CPCM or SMD (§4, Electrostatics). |
+| `SCRF in the route, but no PCM solvent line with Eps` | The job used a solvent model that Q2MM does not read, for example `SCRF=Dipole`. Use PCM, CPCM or SMD (§4, Electrostatics). `SCRF=Check` alone does not cause this error. |

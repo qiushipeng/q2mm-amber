@@ -45,7 +45,9 @@ and CDAT lines.
 
 The Amber calculations use Generalized Born electrostatics (sander igb=1,
 nab gb=1) with the exterior dielectric constant of the QM reference: the Eps
-of the PCM block SCRF prints in the Gaussian logs, or 1 for gas-phase logs.
+of the PCM block SCRF prints in the Gaussian logs, or 1 for gas-phase logs
+(including an opt+freq job whose only SCRF is the SCRF=Check that Gaussian
+writes in the frequency step).
 All logs must agree; a call without a log uses that of the logs named before
 (RDAT runs before CDAT).
 
@@ -86,15 +88,19 @@ logger = logging.getLogger(__file__)
 # both calculate and score can read it without a circular import, and the
 # exclusion is applied at SCORE time (score.compare_data) -- that makes it
 # placement-proof: FXATM only has to precede the COMP/HYBR that scores, not
-# the CDAT that built the data. co is a module global, so Linux-fork swarm
-# workers inherit it like the rest of the swarm's worker state.
+# the CDAT that built the data. The sander minimizations also restrain these
+# atoms (calculators.AmberCalculator._run_sander); that happens when the data
+# are calculated, so for minimized data FXATM must precede CDAT. co is a
+# module global, so Linux-fork swarm workers inherit it like the rest of the
+# swarm's worker state.
 # ---------------------------------------------------------------------------
 
 
 def load_fixed_atoms(path):
     """Read a fixed-atoms file (one 1-based atom index per line) and store the
     exclusion set in co.FIXED_ATOMS. Hessian elements coupling one of these
-    atoms are dropped from the objective at score time (score.compare_data).
+    atoms are dropped from the objective at score time (score.compare_data),
+    and the sander minimizations restrain them to their starting positions.
     Returns the set; a missing/empty path clears the exclusion."""
     atoms = set()
     if path and os.path.isfile(path):
@@ -104,7 +110,8 @@ def load_fixed_atoms(path):
                 if len(s) == 1:
                     atoms.add(int(s[0]))
         logger.log(20, "FXATM: excluding {} fixed atom(s) from the Hessian "
-                   "fit: {}".format(len(atoms), sorted(atoms)))
+                   "fit and restraining them in sander minimizations: {}".format(
+                       len(atoms), sorted(atoms)))
     else:
         logger.warning("FXATM: file not found, no atoms excluded: {}".format(path))
     co.FIXED_ATOMS = set(atoms)

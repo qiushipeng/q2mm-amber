@@ -209,6 +209,7 @@ tests/        unit tests (no Amber installation necessary)
 | script | role |
 |---|---|
 | `build_tsff.py` | Builds the initial TSFF from a RESP mol2 and a mapping file. Writes the re-typed mol2, the frcmod, the LEaP files, and CSV reports of the TS terms to fit. |
+| `compare_qfuerza.py` | Compares the bond and angle force constants of a frcmod with the `qfuerza.py` estimates, and selects the terms for stage 1 and stage 2 of the fit. |
 | `extract_swarm.py` | Reads the `HYBR` history of a run from `root.log` and from the particle directories. |
 
 ### `tests/`
@@ -320,6 +321,10 @@ their input parameters with a warning; accepted projections are averaged
 over valid estimates only. Output is rejected if an estimated Amber value
 would exceed the shared writer's 1999 limit and otherwise be skipped.
 
+To select the terms for stage 1 and stage 2 of the fit, compare the raw and
+inverted estimates with
+[`tools/compare_qfuerza.py`](tools/README.md#compare_qfuerzapy-select-the-terms-to-fit).
+
 Adapted in part from [Samuel Genheden's Seminario
 implementation](https://github.com/SGenheden/Seminario).
 
@@ -336,11 +341,11 @@ In addition to the AMBER backend, this fork adds these features:
   each particle in its own working directory.
 * **`FXATM <file>`**: you give the fixed atoms in a named file in `loop.in`.
   Upstream Q2MM reads a hardcoded `fixedatoms.txt`. Q2MM applies the
-  exclusion when it calculates a score. Thus `FXATM` can come before or
-  after `CDAT`. It applies to each score that Q2MM calculates after the
-  `FXATM` line. It sets the weight of the long-range Hessian couplings of a
-  fixed atom to zero. It keeps the bonded 1-2, 1-3 and 1-4 terms. This
-  agrees with the upstream weighting.
+  exclusion when it calculates a score. It sets the weight of the
+  long-range Hessian couplings of a fixed atom to zero. It keeps the bonded
+  1-2, 1-3 and 1-4 terms. This agrees with the upstream weighting. The
+  sander minimizations also restrain the fixed atoms at their QM positions,
+  so put `FXATM` before `CDAT`.
 * **`build_tsff.py`**: a tool that builds a TSFF from a published parameter
   set.
 * **`FFLD read` keeps a `.orig` backup** of the initial frcmod. At the start

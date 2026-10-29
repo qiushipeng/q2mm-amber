@@ -598,11 +598,14 @@ class GaussLog(File):
     #                         Eps                           =   4.000000
     SOLVENT_LINE = re.compile(r"^\s*Solvent\s*:")
     EPS_VALUE = re.compile(r"\bEps\s*=\s*([0-9.]+)")
+    # SCRF=Check takes the solvent of the checkpoint. Gaussian puts it in the
+    # frequency step it generates for an opt+freq job, also in the gas phase.
+    SCRF_CHECK = re.compile(r"scrf\s*[=(]\s*\(?\s*check", re.IGNORECASE)
 
     def solvent_epsilon(self) -> float:
         """The dielectric constant of the medium the job ran in: the Eps of the
         PCM block SCRF prints (PCM, CPCM, SMD), or 1.0 for a gas-phase job (no
-        SCRF in any route section).
+        SCRF in any route section, or only SCRF=Check, with no PCM block).
 
         Raises:
             ValueError: SCRF without a readable Eps (a solvent model this does
@@ -628,10 +631,17 @@ class GaussLog(File):
                 self.filename, sorted(values)))
         if values:
             return values.pop()
-        if any("scrf" in route.lower() for route in self.route_sections()):
-            raise ValueError("{}: SCRF in the route, but no PCM solvent line with Eps; "
-                             "the solvent model is not one this reads".format(self.filename))
-        return 1.0
+        scrf = [route for route in self.route_sections() if "scrf" in route.lower()]
+        if all(route.lower().count("scrf") == len(self.SCRF_CHECK.findall(route))
+               for route in scrf):
+            if scrf:
+                logger.warning("{}: the only SCRF in its routes is SCRF=Check, which Gaussian "
+                               "adds to the frequency step of an opt+freq job, and the log has "
+                               "no PCM solvent section, so the job is read as gas phase "
+                               "(Eps 1).".format(self.filename))
+            return 1.0
+        raise ValueError("{}: SCRF in the route, but no PCM solvent line with Eps; "
+                         "the solvent model is not one this reads".format(self.filename))
 
     @property
     def esp_rms(self):
@@ -1405,7 +1415,7 @@ class AmberUtilities(object):
         read_frcmod(path)              -> AmberFF
         write_frcmod(ff, ...)          -> lines written
     Engine inputs
-        sander_min_input(maxcyc, ncyc), sander_traj_input(), cpptraj_list_input(),
+        sander_min_input(maxcyc, ncyc), atom_mask(atoms), sander_traj_input(), cpptraj_list_input(),
         cpptraj_measure_input(...), nab_hessian_input(pdb, prmtop)
     Engine outputs
         parse_cpptraj_listing(lines)   -> (bonds, angles, torsions) atom-index lists
@@ -1427,9 +1437,18 @@ class AmberUtilities(object):
   rgbmax    = 15.0,
   ntpr      = 10000,
   ntwx      = 0,
-  ntb       = 0
+  ntb       = 0{restraints}
  /
 """
+
+    # Positional restraints that hold atoms at the reference coordinates in
+    # the minimization. sander's belly option would freeze them outright, but
+    # with GB (igb > 0) it needs the moving atoms first in the topology. At
+    # this weight the restrained atoms of a 98-atom theozyme moved < 0.004 A
+    # in 700 cycles and the minimizer still converged; 1e5 stalled it.
+    RESTRAINT_WT = 1000.0      # kcal/mol/A^2
+    # sander stops with an error on an atom mask longer than this.
+    MAX_MASK_LENGTH = 255
 
     SANDER_TRAJ = """Comments
  &cntrl
@@ -1733,10 +1752,34 @@ nmode( x, 3*m.natoms, mme2, 0, 0, 0.0, 0.0, 0);"""
     # -- engine inputs -------------------------------------------------------
 
     @classmethod
-    def sander_min_input(cls, maxcyc, ncyc, epsilon=1.0):
+    def sander_min_input(cls, maxcyc, ncyc, epsilon=1.0, restrained_atoms=None):
         """sander minimization input; maxcyc=0 gives a single point. `epsilon`
-        is the exterior dielectric constant of the GB electrostatics."""
-        return cls.SANDER_MIN.format(maxcyc=maxcyc, ncyc=ncyc, extdiel=epsilon)
+        is the exterior dielectric constant of the GB electrostatics.
+        `restrained_atoms` (1-based indices) are held at the reference
+        coordinates, which sander reads from its -ref file."""
+        restraints = ""
+        if restrained_atoms:
+            restraints = (",\n  ntr       = 1,\n  restraint_wt = {:.1f},\n"
+                          "  restraintmask = '{}'").format(
+                              cls.RESTRAINT_WT, cls.atom_mask(restrained_atoms))
+        return cls.SANDER_MIN.format(maxcyc=maxcyc, ncyc=ncyc, extdiel=epsilon,
+                                     restraints=restraints)
+
+    @classmethod
+    def atom_mask(cls, atoms):
+        """Amber atom mask of 1-based indices with runs as ranges, e.g. '@1-3,7'.
+        Raises ValueError when the mask is too long for sander."""
+        runs = []
+        for atom in sorted(set(atoms)):
+            if runs and atom == runs[-1][1] + 1:
+                runs[-1][1] = atom
+            else:
+                runs.append([atom, atom])
+        mask = "@" + ",".join(str(a) if a == b else "{}-{}".format(a, b) for a, b in runs)
+        if len(mask) > cls.MAX_MASK_LENGTH:
+            raise ValueError("The atom mask of {} atoms has {} characters; sander reads at "
+                             "most {}.".format(len(set(atoms)), len(mask), cls.MAX_MASK_LENGTH))
+        return mask
 
     @classmethod
     def sander_traj_input(cls):
@@ -2040,6 +2083,14 @@ class AmberEne(File):
                         energy = self.read_line_for_energy(line)
                         if energy is not None:
                             current_structure.props['energy']=energy
+                        flag = 3
+                    elif flag == 3 and line.startswith(" EAMBER"):
+                        # With positional restraints the ENERGY above includes
+                        # the restraint energy; EAMBER leaves it out.
+                        current_structure.props['energy'] = (
+                            float(line.split()[-1]) * co.HARTREE_TO_KJMOL / co.HARTREE_TO_KCALMOL)
+                        flag = 0
+                    elif flag == 3 and line.startswith("---"):
                         flag = 0
             logger.log(5, '  -- Imported {} structure(s)'.format(
                 len(self._structures)))

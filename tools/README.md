@@ -1,10 +1,11 @@
 # `tools/`
 
-This directory has two scripts:
+This directory has three scripts:
 
 | script | purpose |
 |---|---|
 | [`build_tsff.py`](#build_tsffpy-source-resolved-hybrid-force-fields) | Builds the initial TSFF: the re-typed mol2, the frcmod, the LEaP files, and CSV reports of the TS terms to fit. |
+| [`compare_qfuerza.py`](#compare_qfuerzapy-select-the-terms-to-fit) | Compares the bond and angle force constants of a frcmod with the `src/qfuerza.py` estimates, and selects the terms for stage 1 and stage 2 of the fit. |
 | [`extract_swarm.py`](#extract_swarmpy-read-a-hybr-history) | Reads the `HYBR` history of a run from `root.log` and from the particle directories. |
 
 ---
@@ -321,6 +322,108 @@ If LEaP reports a missing term that the CSV lists, examine the rendered key
 in the frcmod. The builder keeps the numerical parameter text. It moves the
 numerical citation fields of Amber `.dat` files into comments, so that cloned
 keys stay valid.
+
+---
+
+# `compare_qfuerza.py`: select the terms to fit
+
+`compare_qfuerza.py` compares the bond and angle force constants of a frcmod
+with the Seminario/FUERZA estimates of
+[`src/qfuerza.py`](../README.md#seeding-force-constants--qfuerzapy). It
+selects the terms for the two stages of the TSFF fit in the QFUERZA paper
+(J. Chem. Theory Comput. 2026, 22, 469, SI section S.4). Use the selection
+for the `PARM` file of each stage.
+
+| stage | fit | terms (default criteria) |
+|---|---|---|
+| 1 | unmodified eigenmatrix: `RDAT -geigz MOL.log`, `CDAT -ageig` | all custom-type terms |
+| 2 | modified Hessian: `RDAT -gh MOL.log -i 4500`, `CDAT -ah` | the custom-type terms whose inverted and raw estimates differ by 1 mdyn/Å (1 mdyn·Å/rad² for an angle) or more |
+
+Stage 2 starts from the force field of stage 1. Reset the stage-2 terms to
+their inverted estimates, and fit only these terms. The SI says that these
+terms are likely to affect the reaction coordinate: the inversion of the TS
+eigenvalue changes them by a large amount.
+
+First, run `qfuerza.py` two times on the same frcmod, mol2 and Gaussian log:
+once as it is, and once with the TS eigenvalue inverted.
+
+```bash
+python ../src/qfuerza.py -i MOL.frcmod -o MOL_qf_raw.frcmod -m MOL.mol2 -gl MOL.log
+python ../src/qfuerza.py -i MOL.frcmod -o MOL_qf_inv.frcmod -m MOL.mol2 -gl MOL.log --invert 4500
+```
+
+The frcmod must have the Q2MM header (refer to "Next step: prepare the fit").
+Use the mol2 that `build_tsff.py` wrote, with the TS bonds. Do not use the
+RESP mol2: its GAFF2 types do not match the custom types in the frcmod, and
+`qfuerza.py` then keeps the input value of each custom term.
+
+Then select the terms with the default criteria:
+
+```bash
+python compare_qfuerza.py MOL.frcmod MOL_qf_raw.frcmod MOL_qf_inv.frcmod \
+    -a MOL_atom_report.csv -o MOL_selection.csv
+```
+
+Or set your own criteria, for example a lower stage-2 limit, one more
+stage-2 term, and one less:
+
+```bash
+python compare_qfuerza.py MOL.frcmod MOL_qf_raw.frcmod MOL_qf_inv.frcmod \
+    -a MOL_atom_report.csv --stage2-min 0.5 --stage2-add AC-HT-DC \
+    --stage2-remove 87 -o MOL_selection.csv
+```
+
+| argument | meaning |
+|---|---|
+| `current` (required) | the frcmod with the current values: the `qfuerza.py -i` input |
+| `raw` (required) | the `qfuerza.py` output without `--invert` |
+| `inverted` | the `qfuerza.py` output with `--invert`. Omit it for a minimum. There is then no stage 2. |
+| `-a`, `--atom-report` | the `_atom_report.csv` of `build_tsff.py`. The types of its `custom` atoms are the custom types. |
+| `-c`, `--custom-types` | the custom types, instead of `-a` |
+| `--stage1-min PERCENT` | put in stage 1 only the custom-type terms whose estimate (the inverted estimate, if given) differs from the current value by PERCENT or more. The default is 0: all custom-type terms. |
+| `--stage2-min VALUE` | the smallest \|inverted − raw\| of a stage-2 term. The default is 1. |
+| `--stage2-units` | the units of `--stage2-min`: `mdyn` (mdyn/Å or mdyn·Å/rad², the default), `frcmod` (kcal/mol/Å² or kcal/mol/rad²) or `percent` (of the inverted estimate). 1 mdyn/Å is 71.97 kcal/mol/Å² in frcmod units. |
+| `--stage2-add TERM ...` | put these terms in stage 2 for all criteria. A term is a frcmod row number, or atom types such as `AC-HT-DC` in either direction. |
+| `--stage2-remove TERM ...` | keep these terms out of stage 2 for all criteria |
+| `-o`, `--out` | the output CSV. The default is standard output. |
+
+The default criteria are the constants `STAGE1_MIN`, `STAGE2_MIN` and
+`STAGE2_UNITS` at the top of the script.
+
+The output has one line for each bond and angle force constant:
+
+| column | meaning |
+|---|---|
+| `row`, `type` | the frcmod line and `bf` (bond) or `af` (angle), as in the `PARM` file |
+| `params` | the atom types of the term |
+| `current` | the value in the current frcmod: kcal/mol/Å² or kcal/mol/rad² |
+| `qfuerza_raw`, `qfuerza_inv` | the two estimates. A cell is empty if `qfuerza.py` kept the input value. |
+| `change_%` | \|estimate − current\| / current × 100, with the inverted estimate if given: the stage-1 criterion |
+| `inv_raw_mdyn`, `inv_raw_%` | \|inverted − raw\| in mdyn/Å or mdyn·Å/rad², and in percent of the inverted estimate: the stage-2 criterion |
+| `custom` | `yes` if the term has a custom type |
+| `stage1`, `stage2` | `yes`, `no` or `CHECK` |
+| `note` | why an estimate is missing, or which option added or removed the term |
+
+The script marks each term with these rules:
+
+* A term with only standard types is in no stage, unless `--stage2-add`
+  names it.
+* `qfuerza.py` keeps the input value when no interaction in the mol2
+  matches the term, or when the term has no valid projection. Thus the
+  script reports an estimate that is equal to the current value as missing,
+  not as a difference of 0 %. The `qfuerza.py` log gives the reason.
+* A custom-type term with an inverted estimate and no raw estimate had no
+  valid raw projection. This is usually a negative curvature along the
+  reaction coordinate. The term goes to stage 2 for all values of
+  `--stage2-min`.
+* A custom-type term is `CHECK` when a missing estimate stops the criteria.
+
+The script writes the criteria, the number of terms in each stage, and the
+stage-2 rows to standard error.
+
+The criteria do not know the reaction coordinate. Examine the terms just
+below the stage-2 limit, for example the angle at a transferring atom. Use
+`--stage2-add` to put such a term in stage 2.
 
 ---
 

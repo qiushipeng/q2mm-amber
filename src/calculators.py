@@ -483,23 +483,30 @@ class AmberCalculator(Calculator):
         """
         Minimize (or single-point) from calc/inpcrd; writes .ene and .rst.
         The old ones are deleted first: a crashed sander run must leave no
-        energy or coordinates of an earlier force field behind.
+        energy or coordinates of an earlier force field behind. A minimization
+        restrains the fixed atoms (FXATM, co.FIXED_ATOMS) to their calc/inpcrd
+        positions, since the QM optimization held them in place too.
         """
         maxcyc, ncyc = self.MIN_CYCLES if self.minimize else self.SP_CYCLES
+        restrained = sorted(co.FIXED_ATOMS) if self.minimize else None
+        # The reference stays calc/inpcrd on a restart, so the fixed atoms
+        # cannot creep from one run to the next.
+        ref = " -ref {}".format(self.INPCRD) if restrained else ""
         min_in = self._calc_name("min")
         ene = self._calc_name("ene")
         rst = self._calc_name("rst")
         self._remove(ene, rst)
-        self._write(min_in, AmberUtilities.sander_min_input(maxcyc, ncyc, self.epsilon))
-        self._run("sander -O -i {} -o {} -p {} -c {} -r {}".format(
-            min_in, ene, self.PRMTOP, self.INPCRD, rst))
+        self._write(min_in, AmberUtilities.sander_min_input(maxcyc, ncyc, self.epsilon,
+                                                            restrained))
+        self._run("sander -O -i {} -o {} -p {} -c {} -r {}{}".format(
+            min_in, ene, self.PRMTOP, self.INPCRD, rst, ref))
         # sander sometimes asks to be restarted; continue from the restart file.
         for _ in range(self.MAX_RESTARTS):
             if not self._sander_wants_restart(ene):
                 break
             logger.warning("sander asked for a restart in {}; restarting.".format(ene))
-            self._run("sander -O -i {} -o {} -p {} -c {} -r {}".format(
-                min_in, ene, self.PRMTOP, rst, rst))
+            self._run("sander -O -i {} -o {} -p {} -c {} -r {}{}".format(
+                min_in, ene, self.PRMTOP, rst, rst, ref))
 
     def _sander_wants_restart(self, ene):
         path = self._path(ene)
