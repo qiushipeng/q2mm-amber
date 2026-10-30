@@ -22,6 +22,7 @@ import_weights(data)            Stamp weights from constants.WEIGHTS onto data.
 hessian_element_weight(sep)     Per-element Hessian weight from the atoms' bond separation.
 compare_data(r_dict, c_dict)    Run the objective function. Returns score (float).
 score_data(ref_data, calc_data) Bucket, trim and compare two Datum lists. Returns score.
+weighted_residuals(ref, calc)   The objective as a vector whose squared norm is the score.
 """
 from __future__ import absolute_import
 from __future__ import division
@@ -179,6 +180,87 @@ def import_weights(data):
             datum.wht = co.WEIGHTS[datum.typ]
 
 
+def _matched_terms(r_dict, c_dict, strict=True):
+    """
+    The terms of the objective function: for each data-type bucket, in
+    sorted order, the list of (r, c, diff, weight, norm), one per matched
+    pair of reference (r) and calculated (c) data points. A pair adds
+    weight**2 * diff**2 / norm to the score. Applies the completeness check,
+    the energy correlation and the weights of compare_data. Returns None
+    when `strict` and a bucket is incomplete (the score is then inf).
+    """
+    terms = {}
+    data_types = sorted(r_dict.keys())
+
+    total_num_energy = sum(
+        len(r_dict[typ]) for typ in data_types if typ in ("e", "eo", "ea", "eao")
+    )
+
+    for typ in data_types:
+        # A bucket that is absent -- or shorter than the reference -- would
+        # otherwise contribute ZERO to the total (the old code skipped it, and
+        # zip() below silently truncates to the shorter list while `norm` still
+        # divides by the full reference count). That REWARDS a force field whose
+        # calculation failed: such a candidate drops the whole penalty for that
+        # data type, so no honest candidate can ever beat it and the optimizer
+        # locks onto it permanently.
+        n_ref = len(r_dict[typ])
+        n_calc = len(c_dict[typ]) if typ in c_dict else 0
+        if n_calc != n_ref:
+            msg = ("data bucket '{}': calculated {} point(s) but reference has "
+                   "{} -- the calculation is incomplete.".format(typ, n_calc, n_ref))
+            if strict:
+                logger.warning(msg + " Scoring as inf.")
+                return None
+            logger.warning(msg + " Bucket skipped; score is NOT comparable.")
+            continue
+        if typ in ("e", "eo", "ea", "eao"):
+            correlate_energies(r_dict[typ], c_dict[typ])
+        # Stamp weights on BOTH reference and calculated datums. The
+        # typ='h' branch below uses c.wht (q2mm-master convention where
+        # the FF side carries per-contact weights like h12/h13/h14),
+        # while other branches use r.wht -- so we need both to be set.
+        import_weights(r_dict[typ])
+        import_weights(c_dict[typ])
+
+        pairs = []
+        for r, c in zip(r_dict[typ], c_dict[typ]):
+            if c.typ == "t":
+                diff = abs(r.val - c.val)
+                if diff > 180.0:
+                    diff = 360.0 - diff
+            else:
+                diff = r.val - c.val
+
+            # disp_wht is the weight actually applied to this datum, so the
+            # printed Weight column reflects the real scoring weight. For
+            # typ='h' that's the calculated-side distance weight (c.wht);
+            # everything else uses the reference-side weight (r.wht).
+            if typ in ("e", "eo", "ea", "eao"):
+                norm = total_num_energy if total_num_energy else 1
+                disp_wht = r.wht
+            elif typ == "h":
+                norm = len(c_dict[typ]) if len(c_dict[typ]) else 1
+                disp_wht = c.wht
+                # FXATM: drop the LONG-RANGE Hessian couplings of a fixed atom,
+                # matching q2mm-master (bonded 1-2/1-3/1-4 terms are kept). c.sep
+                # is the atoms' bond separation stamped at build time; > 3 is
+                # the long-range class. Applied here (score time) so it is
+                # placement-proof -- FXATM only has to precede the COMP/HYBR
+                # that scores, not the CDAT that built the data. Overrides the
+                # printed Weight column too, so start/opt stay consistent.
+                # co.FIXED_ATOMS defaults to empty.
+                if getattr(co, "FIXED_ATOMS", None) and c.sep is not None and c.sep > 3 \
+                        and (c.atm_1 in co.FIXED_ATOMS or c.atm_2 in co.FIXED_ATOMS):
+                    disp_wht = 0.0
+            else:
+                norm = len(r_dict[typ]) if len(r_dict[typ]) else 1
+                disp_wht = r.wht
+            pairs.append((r, c, diff, disp_wht, norm))
+        terms[typ] = pairs
+    return terms
+
+
 def compare_data(r_dict, c_dict, output=None, doprint=False, strict=True):
     """
     Compute chi^2 = sum w^2 * (x_r - x_c)^2, bucket-normalised.
@@ -215,78 +297,15 @@ def compare_data(r_dict, c_dict, output=None, doprint=False, strict=True):
     score_typ = defaultdict(float)
     num_typ = defaultdict(int)
     score_tot = 0.0
-    total_num = 0
 
-    data_types = sorted(r_dict.keys())
+    terms = _matched_terms(r_dict, c_dict, strict=strict)
+    if terms is None:
+        return float("inf")
+    total_num = sum(len(pairs) for pairs in terms.values())
 
-    total_num_energy = sum(
-        len(r_dict[typ]) for typ in data_types if typ in ("e", "eo", "ea", "eao")
-    )
-
-    for typ in data_types:
-        # A bucket that is absent -- or shorter than the reference -- would
-        # otherwise contribute ZERO to the total (the old code skipped it, and
-        # zip() below silently truncates to the shorter list while `norm` still
-        # divides by the full reference count). That REWARDS a force field whose
-        # calculation failed: such a candidate drops the whole penalty for that
-        # data type, so no honest candidate can ever beat it and the optimizer
-        # locks onto it permanently.
-        n_ref = len(r_dict[typ])
-        n_calc = len(c_dict[typ]) if typ in c_dict else 0
-        if n_calc != n_ref:
-            msg = ("data bucket '{}': calculated {} point(s) but reference has "
-                   "{} -- the calculation is incomplete.".format(typ, n_calc, n_ref))
-            if strict:
-                logger.warning(msg + " Scoring as inf.")
-                return float("inf")
-            logger.warning(msg + " Bucket skipped; score is NOT comparable.")
-            continue
-        total_num += len(r_dict[typ])
-        if typ in ("e", "eo", "ea", "eao"):
-            correlate_energies(r_dict[typ], c_dict[typ])
-        # Stamp weights on BOTH reference and calculated datums. The
-        # typ='h' branch below uses c.wht (q2mm-master convention where
-        # the FF side carries per-contact weights like h12/h13/h14),
-        # while other branches use r.wht -- so we need both to be set.
-        import_weights(r_dict[typ])
-        import_weights(c_dict[typ])
-
-        for r, c in zip(r_dict[typ], c_dict[typ]):
-            if c.typ == "t":
-                diff = abs(r.val - c.val)
-                if diff > 180.0:
-                    diff = 360.0 - diff
-            else:
-                diff = r.val - c.val
-
-            # disp_wht is the weight actually applied to this datum, so the
-            # printed Weight column reflects the real scoring weight. For
-            # typ='h' that's the calculated-side distance weight (c.wht);
-            # everything else uses the reference-side weight (r.wht).
-            if typ in ("e", "eo", "ea", "eao"):
-                norm = total_num_energy if total_num_energy else 1
-                disp_wht = r.wht
-                score = (disp_wht ** 2 * diff ** 2) / norm
-            elif typ == "h":
-                norm = len(c_dict[typ]) if len(c_dict[typ]) else 1
-                disp_wht = c.wht
-                # FXATM: drop the LONG-RANGE Hessian couplings of a fixed atom,
-                # matching q2mm-master (bonded 1-2/1-3/1-4 terms are kept). c.sep
-                # is the atoms' bond separation stamped at build time; > 3 is
-                # the long-range class. Applied here (score time) so it is
-                # placement-proof -- FXATM only has to precede the COMP/HYBR
-                # that scores, not the CDAT that built the data. Overrides the
-                # printed Weight column too, so start/opt stay consistent.
-                # co.FIXED_ATOMS defaults to empty.
-                if getattr(co, "FIXED_ATOMS", None) and c.sep is not None and c.sep > 3 \
-                        and (c.atm_1 in co.FIXED_ATOMS or c.atm_2 in co.FIXED_ATOMS):
-                    disp_wht = 0.0
-                score = (disp_wht ** 2 * diff ** 2) / norm
-            else:
-                norm = len(r_dict[typ]) if len(r_dict[typ]) else 1
-                disp_wht = r.wht
-                score = (disp_wht ** 2 * diff ** 2) / norm
-
+    for pairs in terms.values():
+        for r, c, diff, disp_wht, norm in pairs:
+            score = (disp_wht ** 2 * diff ** 2) / norm
             score_tot += score
             score_typ[c.typ] += score
             num_typ[c.typ] += 1
@@ -346,3 +365,23 @@ def score_data(ref_data, calc_data, output=None, doprint=False):
     c_dict = data_by_type(calc_data)
     r_dict, c_dict = trim_data(r_dict, c_dict)
     return compare_data(r_dict, c_dict, output=output, doprint=doprint)
+
+
+def weighted_residuals(ref_data, calc_data):
+    """
+    The objective function as a vector, for least-squares fitting (lsq.py):
+    one element weight * (x_r - x_c) / sqrt(norm) per matched data point,
+    with the weights and normalization of compare_data, so that its squared
+    norm is score_data(ref_data, calc_data). A torsion contributes its
+    wrapped absolute difference. Returns None when a data-type bucket is
+    incomplete (the score is then inf).
+    """
+    r_dict = data_by_type(ref_data)
+    c_dict = data_by_type(calc_data)
+    r_dict, c_dict = trim_data(r_dict, c_dict)
+    terms = _matched_terms(r_dict, c_dict)
+    if terms is None:
+        return None
+    return np.array([wht * diff / np.sqrt(norm)
+                     for pairs in terms.values()
+                     for _, _, diff, wht, norm in pairs], dtype=float)

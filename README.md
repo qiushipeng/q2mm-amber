@@ -26,6 +26,7 @@ force field (`mm3.fld`) and MacroModel. This package is the AMBER equivalent:
 The command words (`DIR`, `FFLD`, `PARM`, `RDAT`, `CDAT`, `COMP`,
 `LOOP`/`END`, `GRAD`, `SIMP`, `HYBR`) are the same as in upstream Q2MM on
 purpose. Thus loop files and workflows look the same in the two packages.
+`LSQ` (exact least squares) is a new command of this package.
 
 ---
 
@@ -34,14 +35,14 @@ purpose. Thus loop files and workflows look the same in the two packages.
 | document | contents |
 |---|---|
 | **[`tools/README.md`](tools/README.md)** | **Start here.** How to build the initial TSFF with `build_tsff.py`: atom types, parameter sources, outputs, and the changes that the fit needs. How to read a `HYBR` history with `extract_swarm.py`. |
-| **[`OPTIMIZATION.md`](OPTIMIZATION.md)** | How to run the fit: the AmberTools patch, the run directory, the parameter file, `loop.in`, Hessian and eigenmode fitting, the `GRAD` and `HYBR` optimizers, outputs, and troubleshooting. |
+| **[`OPTIMIZATION.md`](OPTIMIZATION.md)** | How to run the fit: the AmberTools patch, the run directory, the parameter file, `loop.in`, Hessian and eigenmode fitting, the `GRAD`, `HYBR` and `LSQ` optimizers, outputs, and troubleshooting. |
 
 ---
 
 ## Requirements
 
-* **Python 3** with `numpy`. A conda environment is sufficient. You do not
-  need Schrödinger.
+* **Python 3** with `numpy`, and `scipy` for the `LSQ` command. A conda
+  environment is sufficient. You do not need Schrödinger.
 * **AmberTools**: `tleap`, `sander`, `antechamber`, `parmchk2`, `cpptraj`.
 * **AmberClassic** (or an AmberTools build) that supplies `nab`.
 * A `nab`/`nmode` build with **the patch that writes the Hessian**. Refer to
@@ -77,7 +78,7 @@ source $AMBERHOME/amber.sh
               |            => Seminario/FUERZA estimates
               |
    4. fit against QM  -------------------->  OPTIMIZATION.md
-        loop.py  +  GRAD / SIMP / HYBR
+        loop.py  +  GRAD / SIMP / HYBR / LSQ
               |            => optimized frcmod
               |
    5. validate: MD with the TSFF
@@ -158,7 +159,7 @@ To see the improvement, compare `start.txt` with `opt.txt`.
 
 ## Optimizers
 
-The three optimizers minimize the same objective. The objective is a weighted
+The four optimizers minimize the same objective. The objective is a weighted
 sum of squared differences between the QM reference values and the
 force-field values. Q2MM normalizes each data type separately:
 
@@ -171,9 +172,12 @@ score = sum over types (1 / N_type) * sum over points  w^2 * (reference - calcul
 | `GRAD` | gradient least squares (lagrange, newton, lstsq, levenberg, svd) | Local. Fast and precise near a good start. Put it inside `LOOP … END`. |
 | `SIMP` | simplex | Local. For a small final polish. |
 | `HYBR` | particle swarm + differential evolution | Global and slow. It tolerates bad seeds. Put it inside `LOOP … END`. The `LOOP` convergence value also stops the swarm. |
+| `LSQ` | exact bounded linear least squares (`scipy.optimize.lsq_linear`) | One step, N + 2 Amber calculations for N parameters. Only for force constants and barriers against `-ah` or `-ageig` data, which are linear in them. It needs no `LOOP`. Refer to [`OPTIMIZATION.md` §7](OPTIMIZATION.md). |
 
 For a TSFF, the forming and breaking coordinates start from placeholder seeds.
 Thus you usually need a `HYBR` pass before `GRAD` can make useful progress.
+For force constants against Hessian or eigenmatrix data, `LSQ` does not need
+good seeds: it finds the exact minimum within the bounds from any start.
 
 ---
 
@@ -192,11 +196,12 @@ tests/        unit tests (no Amber installation necessary)
 | `loop.py` | **Entry point.** Reads `loop.in` and sends each command to the module that runs it. |
 | `calculate.py` | The `RDAT`/`CDAT` command line. Reads the Gaussian reference data. Builds the `Calculator` from the `CDAT` arguments. |
 | `calculators.py` | `Calculator`: the interface between the optimizers and an MM engine. A force field (`FF`) goes in, and `Datum` objects come out. `AmberCalculator` runs tleap, sander, cpptraj and nab for one system. `CalculatorGroup` runs several systems as one calculator. For a parallel `HYBR`, `Calculator.evaluate_many` gives each particle its own directory and runs the particles on a pool of worker processes. |
-| `score.py` | The objective function (`compare_data`), the weights for each data type and for each Hessian element, and data trimming. |
+| `score.py` | The objective function (`compare_data`), the weights for each data type and for each Hessian element, and data trimming. `weighted_residuals` gives the same objective as a vector for `LSQ`. |
 | `opt.py` | The optimizer base class, and `SwarmOptimizer` (the adapter for `HYBR`). |
 | `hybrid_optimizer.py` | The `PSO_DE` engine (particle swarm + differential evolution). |
 | `gradient.py` | The gradient optimizer (`GRAD`). |
 | `simplex.py` | The simplex optimizer (`SIMP`). |
+| `lsq.py` | The exact bounded least-squares fit (`LSQ`) of force constants and barriers. |
 | `parameters.py` | Parameter selection and trimming (`PARM`). |
 | `data_structs.py` | `Datum`, `Param`, `AmberFF`, `Structure` and related types. Also the builders that make `Datum` objects from a Hessian, a geometry or an energy. |
 | `utilities.py` | File input and output: `AmberUtilities` (the frcmod, and the sander, cpptraj and nab files), `Frcmod`, and the readers for Gaussian logs and mol2 files. |
@@ -346,6 +351,11 @@ In addition to the AMBER backend, this fork adds these features:
   1-2, 1-3 and 1-4 terms. This agrees with the upstream weighting. The
   sander minimizations also restrain the fixed atoms at their QM positions,
   so put `FXATM` before `CDAT`.
+* **`LSQ`**: the exact bounded least-squares fit of force constants and
+  barriers against Hessian (`-ah`) or eigenmatrix (`-ageig`) data. These
+  data are linear in these parameters, so one solve with N + 2 Amber
+  calculations gives the minimum within the bounds. Upstream Q2MM has no
+  such command.
 * **`build_tsff.py`**: a tool that builds a TSFF from a published parameter
   set.
 * **`FFLD read` keeps a `.orig` backup** of the initial frcmod. At the start
@@ -373,7 +383,8 @@ In addition to the AMBER backend, this fork adds these features:
 
 `DIR` sets the directory for the `FFLD`, `PARM`, `FXATM` and `COMP -o` files.
 The run outputs (`ff_NNN.frcmod`, `swarm_particles/`,
-`hybrid_opt_history.bin`) also go to that directory. `RDAT` and `CDAT` do not
+`hybrid_opt_history.bin`, `lsq_NNN.csv`, `lsq_particles/`) also go to that
+directory. `RDAT` and `CDAT` do not
 use `DIR`. They find their files relative to the directory where you start
 `loop.py`, or relative to their `-d` option. Thus start `loop.py` from the
 run directory, and set `DIR` to the absolute path of that directory.

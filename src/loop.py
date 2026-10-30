@@ -32,6 +32,12 @@ HYBR [--max_iter N] [--pop_size N] [--tight T|F] [--n_processes N]
                           swarm persists from cycle to cycle, the LOOP's
                           convergence is also the swarm's own precision,
                           and a new LOOP block starts a new swarm.
+LSQ [--n_processes N]     Exact bounded least-squares fit (lsq.LeastSquares)
+                          of force constants and barriers (bf, af, df, imp1)
+                          against -ah / -ageig data, which are linear in
+                          them: N + 2 Amber evaluations for N parameters.
+                          Needs no LOOP block. Writes lsq_NNN.csv; with
+                          --n_processes > 1 runs in <DIR>/lsq_particles.
 WGHT <typ> <weight>       Override constants.WEIGHTS[typ] (eg "WGHT b 100.").
 STEP <ptype> <step>       Override constants.STEPS[ptype].
 FXATM <file>              Exclude fixed atoms from the Hessian fit. <file>
@@ -225,6 +231,9 @@ class Loop(object):
             elif cmd == "HYBR":
                 self._handle_hybr(cols)
 
+            elif cmd == "LSQ":
+                self._handle_lsq(cols)
+
             elif cmd == "WGHT":
                 co.WEIGHTS[cols[1]] = float(cols[2])
                 logger.log(20, "WGHT {} = {}".format(cols[1], cols[2]))
@@ -347,6 +356,16 @@ class Loop(object):
         finally:
             self._dump_swarm_history(self.swarm)
 
+    def _handle_lsq(self, cols):
+        import lsq
+        fit = lsq.LeastSquares(
+            direc=self.direc, ff=self.ff,
+            ff_lines=self.ff.lines, args_ff=self.args_ff,
+            args_ref=self.args_ref, calculator=self._get_calculator(),
+            **parse_lsq_options(cols[1:])
+        )
+        self.ff = fit.run(ref_data=self.ref_data)
+
     def _dump_swarm_history(self, swarm):
         """Persist the swarm history to hybrid_opt_history.bin.
 
@@ -408,6 +427,24 @@ def parse_hybr_options(tokens):
         "tight_spread": opts.tight.lower() in ("t", "true", "1", "yes"),
         "n_processes": opts.n_processes,
     }
+
+
+class _LsqOptionParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise ValueError("LSQ: {}".format(message))
+
+
+def parse_lsq_options(tokens):
+    """
+    Parse "--n_processes N" into LeastSquares keyword arguments. The option
+    is optional (default 1, serial); an unknown one is an error.
+    """
+    parser = _LsqOptionParser(prog="LSQ", add_help=False)
+    parser.add_argument("--n_processes", type=int, default=1)
+    opts, unknown = parser.parse_known_args(tokens)
+    if unknown:
+        raise ValueError("LSQ: unrecognised option(s) {}".format(" ".join(unknown)))
+    return {"n_processes": opts.n_processes}
 
 
 # ---------------------------------------------------------------------------

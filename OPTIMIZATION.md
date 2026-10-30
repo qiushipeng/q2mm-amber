@@ -1,4 +1,4 @@
-# Running the Q2MM fit: gradient and hybrid optimizers
+# Running the Q2MM fit: gradient, hybrid and least-squares optimizers
 
 This guide continues from [`tools/README.md`](tools/README.md). That guide
 ends with these files from `build_tsff.py`:
@@ -10,7 +10,7 @@ ends with these files from `build_tsff.py`:
 
 This guide fits those parameters to the QM data.
 
-The three optimizers minimize the same objective. Only their search methods
+The four optimizers minimize the same objective. Only their search methods
 are different:
 
 | command | method | use it for |
@@ -18,6 +18,7 @@ are different:
 | `GRAD` | gradient least squares (local) | parameters that are already almost correct |
 | `SIMP` | simplex (local) | a small final polish of a few parameters |
 | `HYBR` | hybrid particle swarm + differential evolution (global) | seeds that are far from correct, or a rough start |
+| `LSQ` | exact bounded linear least squares (one step) | force constants and barriers against `-ah` or `-ageig` data only (§7) |
 
 ---
 
@@ -29,7 +30,7 @@ are different:
 | `$WORK` | your run directory (absolute path) |
 | `$AMBERHOME` | your AmberTools installation |
 | `$AMBERCLASSICHOME` | your AmberClassic installation (it supplies `nab`) |
-| `MOL` | the stem of your molecule files, for example `Thio` |
+| `MOL` | the stem of your molecule files, for example `ts1` |
 
 Set the Amber variables for your site. The paths are different on each
 installation.
@@ -123,7 +124,7 @@ source $AMBERHOME/amber.sh
 ## 2. Run directory
 
 Put all files in one directory. Set `DIR` to the **absolute path** of this
-directory, and start `loop.py` from it (§8).
+directory, and start `loop.py` from it (§9).
 
 | file | role |
 |---|---|
@@ -288,6 +289,7 @@ Q2MM runs the commands in order, from top to bottom.
 | `GRAD [opts]` | Gradient optimizer (§5). |
 | `SIMP [max_params=N]` | Simplex optimizer. |
 | `HYBR [opts]` | Hybrid optimizer (§6), inside `LOOP … END`. |
+| `LSQ [--n_processes N]` | Exact least-squares fit of force constants and barriers (§7). It needs no `LOOP`. |
 | `WGHT <typ> <w>` | Change the weight of one data type. |
 | `STEP <ptype> <s>` | Change one differentiation step. |
 | `FXATM <file>` | Exclude fixed atoms from the Hessian fit and restrain them in the minimizations. Put it before `CDAT`. |
@@ -332,7 +334,7 @@ curvature. They use different bases.
 
 * **Hessian fitting** (`-gh` / `-ah`) compares the two mass-weighted
   Cartesian Hessians element by element. The weight of each element depends
-  on the number of bonds between its two atoms (§7).
+  on the number of bonds between its two atoms (§8).
 * **Eigenmode fitting** (`-geigz` / `-ageig`) is the original Q2MM
   objective. This port comes from the upstream hybrid-opt branch.
   * The reference is the diagonal matrix of the QM eigenvalues, one for each
@@ -473,7 +475,7 @@ Q2MM reads ε from the Gaussian logs that `RDAT` and `CDAT` name: `-gh`,
   this warning:
 
   ```
-  Thio.log: the only SCRF in its routes is SCRF=Check, which Gaussian adds to the frequency step of an opt+freq job, and the log has no PCM solvent section, so the job is read as gas phase (Eps 1).
+  MOL.log: the only SCRF in its routes is SCRF=Check, which Gaussian adds to the frequency step of an opt+freq job, and the log has no PCM solvent section, so the job is read as gas phase (Eps 1).
   ```
 * A `CDAT` line without a log, for example `-ah MOL.in`, uses the ε of the
   logs that `RDAT` read.
@@ -505,7 +507,7 @@ the cutoff removes some interactions.
 > **Scores from older versions are different.** Older versions of
 > q2mm-amber used a constant dielectric of 80.40 (water) in the nab Hessian,
 > and 1 in sander. Do not compare scores from the two versions. For example,
-> the start eigenmode score of one TS model changed from 6.133 to 5.905.
+> the start eigenmode score of a TS model can change by a few percent.
 
 ### `FXATM`: fixed atoms
 
@@ -524,13 +526,10 @@ Q2MM reads only the lines that contain exactly one number. An example
 `fixedatoms.txt`:
 
 ```
-18
-20
-32
-35
-38
-41
-43
+3
+7
+12
+15
 ```
 
 This example uses `FXATM` with an `-ah` / `-gh` cycle, because `FXATM`
@@ -538,18 +537,18 @@ applies to the Hessian:
 
 ```
 DIR $WORK
-FFLD read Thio.frcmod
-PARM BandA_FC.txt
-RDAT -gh Thio.log -i 4500
+FFLD read MOL.frcmod
+PARM params.txt
+RDAT -gh MOL.log -i 4500
 FXATM fixedatoms.txt          # exclude these atoms from the Hessian fit
-CDAT -ah Thio.in
-COMP -o ./bafc_start.txt
+CDAT -ah MOL.in
+COMP -o ./start.txt
 LOOP 0.001
 HYBR --max_iter 200 --pop_size 24 --tight false --n_processes 24
 END
 FFLD write ./frcmod.gaff.01
 CDAT
-COMP -o ./bafc_opt.01.txt
+COMP -o ./opt.txt
 ```
 
 The effect on the weights:
@@ -570,9 +569,9 @@ and `-ageig` also start one), because the QM optimization held them in place
 too. sander restrains them to their `calc/inpcrd` positions (the mol2
 geometry) with `ntr = 1` and 1000 kcal/mol/Å². sander cannot freeze them with
 its belly option, because with GB that option needs the moving atoms first
-in the topology. On a 98-atom theozyme the restrained atoms moved less than
-0.004 Å in 700 cycles (0.53 Å without the restraint), and the minimization
-still converged. The minimized energies are the `EAMBER` value of sander,
+in the topology. In a test, the restrained atoms moved less than 0.004 Å in
+700 cycles (0.53 Å without the restraint), and the minimization still
+converged. The minimized energies are the `EAMBER` value of sander,
 without the restraint energy. The single points (`-ae`, `-ae1`, `-ab`,
 `-aa`, `-at` and the reference `-gabo`/`-gaao`/`-gato`) have no restraint.
 
@@ -737,7 +736,7 @@ optimizer does these steps:
 3. It compares the calculated data with the reference data
    (`score.score_data`).
 
-The swarm **minimizes** that score (§7). If an evaluation fails, the particle
+The swarm **minimizes** that score (§8). If an evaluation fails, the particle
 gets the score `inf`. Thus it cannot become the best particle. `HYBR` uses
 the **same objective** as `GRAD` and `SIMP`. Only the search is different.
 
@@ -840,9 +839,154 @@ result. Consider a second production run to compare the results.
 
 ---
 
-## 7. The scoring function
+## 7. Exact least squares (`LSQ`)
 
-All three optimizers minimize the same objective (`score.compare_data`):
+`LSQ` calculates the best values of force constants and barriers within
+their bounds in one step. It is exact, not a search. Use it when the
+parameters are force constants or barriers and the data are `-ah` or
+`-ageig`. Source: `src/lsq.py::LeastSquares`.
+
+### Why one step is sufficient
+
+nab calculates the Amber Hessian at the fixed geometry of `MOL.pdb` (§4).
+This Hessian is a **linear** function of the bond and angle force constants
+and of the dihedral and improper barriers. The eigenmatrix of `-ageig` is
+that Hessian projected on fixed QM normal modes, so it is linear too. The
+weights of the data do not change with the parameters. Thus the score of
+these data is a quadratic function of the parameters, with one minimum
+inside the bounds:
+
+```
+score(k) = || r(k) ||²        r(k) = r(k₀) + J · (k − k₀)
+```
+
+`r` is the vector of the weighted differences between the reference and the
+calculated data (`score.weighted_residuals`). Its squared length is the
+score of §8. `J` tells how much each parameter changes each difference.
+
+### What `LSQ` does
+
+1. **The linear model.** Amber calculates the data at the start values.
+   Then Amber calculates the data once for each parameter, with that
+   parameter moved by 10 % of its value (at least 1). The step goes up, or
+   down when the step up would cross the upper bound. Q2MM rounds each value
+   to the decimals that the frcmod stores (4 for bonds and angles, 5 for
+   dihedrals and impropers). Thus the model uses exactly the values that
+   Amber reads. These N + 1 calculations give `r(k₀)` and `J`.
+2. **The solution.** `scipy.optimize.lsq_linear` (method `bvls`) finds the
+   minimum of the model inside the bounds.
+3. **The check.** Amber calculates the data of the solution once more.
+   Q2MM compares this score with the score that the model predicts.
+
+Thus `LSQ` needs **N + 2** Amber calculations for N parameters. A `GRAD` or
+`HYBR` fit of the same parameters needs many more calculations, and it
+stops near the minimum, not at the minimum.
+
+### Synopsis
+
+```
+LSQ [--n_processes N]
+```
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `--n_processes` | int | **1** | number of parallel Amber calculations. `1` = serial, in the run directory. With more than 1, each calculation runs in its own directory, `lsq_particles/p_NNN`. |
+
+* `LSQ` needs **no** `LOOP … END` block. Inside a block, the second cycle
+  finds the same solution, and the block stops.
+* Request the number of cores that you give to `--n_processes` (§9).
+
+### What `LSQ` accepts
+
+| item | accepted | reason |
+|---|---|---|
+| parameters (`params.txt`) | bond and angle force constants (`bf`, `af`), dihedral and improper barriers (`df`, `imp1`) | Only these change the fixed-geometry Hessian linearly. |
+| `CDAT` data | `-ah`, `-ageig` | A minimized geometry or energy is not linear in the parameters. |
+
+Another parameter type (for example an equilibrium value) or another `CDAT`
+flag stops the run with an error. Fit those with `GRAD`, `SIMP` or `HYBR`.
+`FXATM` applies to `-ah` data as in the score.
+
+**Bounds.** `LSQ` uses the bounds of `params.txt` (§3), limited to ±1999,
+because the frcmod writer cannot write a larger value. A force constant
+without a bound can go from 0 to 1999. A dihedral barrier without a bound
+can go from −1999 to 1999.
+
+### The check of the solution
+
+The score that Amber calculates for the solution must agree with the score
+that the model predicts. Because the data are linear, only the rounding of
+the stored values makes them different.
+
+* A relative difference of 10⁻⁶ or less: the log shows that the two scores
+  agree.
+* A larger difference: Q2MM writes a warning with the two scores. `LSQ`
+  keeps the solution only if Amber scores it lower than the start, as `GRAD`
+  and `HYBR` do. Causes: an Amber calculation went wrong, or the data are
+  not linear in the parameters.
+* If an Amber calculation fails, `LSQ` keeps the start force field.
+
+### Parameters that the data do not determine
+
+* A parameter that has **no effect** on the data keeps its start value.
+  Its status is `no effect`. Usually its term is not in the molecule, or
+  the data do not see it.
+* Some **combinations** of parameters can change the data very little. The
+  log shows the condition number of the model and the three worst-determined
+  combinations (each parameter scaled by its column norm). `LSQ` solves them
+  as all the others. A large condition number tells you that the data do not
+  determine these combinations well: their values can change much for a very
+  small change of the score.
+
+### Outputs
+
+* `root.log`: the start score, the predicted score, the Amber score of the
+  solution, the agreement, the parameters at a bound or without effect, the
+  solver message, the first-order optimality (0 at the exact optimum), the
+  condition number and the worst-determined combinations.
+* `lsq_001.csv`, `lsq_002.csv`, …: one file for each `LSQ` command. The
+  numbers continue from the files that are already in the directory. One row
+  for each parameter:
+
+| column | meaning |
+|---|---|
+| `ff_row`, `ff_col` | the line and the column of the parameter in the frcmod |
+| `ptype` | the parameter type (`bf`, `af`, `df`, `imp1`) |
+| `atom_types` | the atom types of the term |
+| `start` | the start value, as the frcmod stores it |
+| `solution` | the value that `LSQ` calculated. The log tells if `LSQ` kept it. |
+| `lower`, `upper` | the bounds that `LSQ` used |
+| `status` | `free`, `at lower bound`, `at upper bound` or `no effect` |
+| `column_norm` | how much the parameter changes the weighted differences for each unit of the parameter. `0` means no effect. |
+
+### Complete example
+
+```
+DIR $WORK
+FFLD read MOL.frcmod
+PARM params.txt
+RDAT -geigz MOL.log
+CDAT -ageig MOL.in,MOL.log
+COMP -o start.txt
+LSQ --n_processes 8
+FFLD write frcmod.lsq
+CDAT
+COMP -o opt.txt
+```
+
+In a staged fit (§11), each cycle that fits only force constants or barriers
+against `-ah` or `-ageig` data can use `LSQ` in place of `GRAD` or `HYBR`.
+Examples are the force-constant cycle, and both stages of the two-stage fit
+whose terms `tools/compare_qfuerza.py` selects (refer to
+[`tools/README.md`](tools/README.md)). A cycle with geometry data cannot use
+`LSQ`.
+
+---
+
+## 8. The scoring function
+
+All four optimizers minimize the same objective (`score.compare_data`).
+`LSQ` uses the same terms as a vector (`score.weighted_residuals`):
 
 ```
 score = Σ over types  (1 / N_type) · Σ over points  w² · (reference − calculated)²
@@ -876,7 +1020,7 @@ to the total. Q2MM excludes a row only when its **Weight** column shows
 
 ---
 
-## 8. Running
+## 9. Running
 
 Start `loop.py` from the run directory. `RDAT` and `CDAT` find their files
 relative to this directory. `root.log` also goes to this directory.
@@ -905,9 +1049,11 @@ python $SRC/loop.py loop.in
 
 > **Before you run again in the same directory:**
 >
-> * You do not have to delete `swarm_particles/` or `calc/`. Q2MM writes
->   over the files in old particle directories. It also deletes the old
->   Amber outputs before each step.
+> * You do not have to delete `swarm_particles/`, `lsq_particles/` or
+>   `calc/`. Q2MM writes over the files in old particle directories. It also
+>   deletes the old Amber outputs before each step.
+> * The `lsq_NNN.csv` numbers continue from the files that are already in
+>   the directory.
 > * The `ff_NNN.frcmod` numbers continue from the files that are already in
 >   the directory.
 > * `FFLD read` keeps a one-time `MOL.frcmod.orig` backup. At the start of
@@ -917,7 +1063,7 @@ python $SRC/loop.py loop.in
 
 ---
 
-## 9. Outputs
+## 10. Outputs
 
 | file | contents |
 |---|---|
@@ -930,16 +1076,19 @@ python $SRC/loop.py loop.in
 | `amber.MOL.log` | the output of the Amber programs for the last evaluation |
 | `calc/` | Amber scratch files: `prmtop`, `inpcrd`, `.ene`, `.lst` (the topology listing that sets the Hessian weights), `.geo`, `.hes` |
 | `swarm_particles/` | a scratch directory for each particle (parallel `HYBR` only) |
+| `lsq_001.csv`, `lsq_002.csv`, … | the result of each `LSQ` command: one row for each parameter (§7) |
+| `lsq_particles/` | a scratch directory for each Amber calculation of a parallel `LSQ` (`--n_processes` more than 1) |
 
 Compare `start.txt` with `opt.txt`. The `Total score` lines show the
 improvement. The breakdown for each type below them shows the source of the
 improvement. The log contains `INIT FF SCORE`. For `HYBR`, the log also
 contains the line `Iter: k, Best fit: … at [params]` for each iteration.
-[`tools/extract_swarm.py`](tools/README.md) reads these lines.
+[`tools/extract_swarm.py`](tools/README.md) reads these lines. For `LSQ`,
+the log contains the block after `LEAST-SQUARES FIT` (§7).
 
 ---
 
-## 10. Staged cycles
+## 11. Staged cycles
 
 A fit of all parameters at the same time from rough seeds is
 ill-conditioned. The usual method is to fit subsets, in the order of how well
@@ -959,6 +1108,10 @@ Fit the force constants first, because the Hessian determines them directly.
 Fit the torsions last. They are soft, and their coupling to the stiff terms
 is weak.
 
+A cycle that fits only force constants or barriers against Hessian or
+eigenmatrix data (cycle 1, for example) can use `LSQ` (§7). A cycle with
+equilibria, or with geometry or torsion data, cannot.
+
 ---
 
 ## Troubleshooting
@@ -976,6 +1129,12 @@ is weak.
 | `HYBR` overloads the node | `n_processes` is more than the number of reserved cores. Q2MM does not limit the workers to the available cores. |
 | Two runs give different results | This result is normal. `HYBR` is stochastic and has no fixed seed. |
 | `HYBR: unrecognised option(s)` | Options are `--name value` pairs (`--max_iter 200`). The old `name=value` form and `precision` are not available. The `LOOP` convergence is the precision now. |
+| `LSQ fits only force constants and barriers (parameter types bf, af, df, imp1)` | `params.txt` selects another parameter type, for example an equilibrium value. Fit it with `GRAD`, `SIMP` or `HYBR`, in a separate cycle (§7). |
+| `LSQ needs data that are linear in the parameters (CDAT -ah and -ageig)` | The `CDAT` line has a geometry or energy flag. Use only `-ah` or `-ageig` with `LSQ` (§7). |
+| `LSQ: … cannot move within its bounds`, or `LSQ: … starts at …, outside […]` | The bounds of the parameter in `params.txt` are equal, or the start value is out of the range that the frcmod can hold (±1999). Correct the bounds, or remove the parameter from `params.txt`. |
+| `LSQ: Amber scored the solution …, but the linear model predicted …` | The check of §7 failed. Look for a failed Amber calculation in `amber.MOL.log`. `LSQ` keeps the solution only if it is better than the start. |
+| `LSQ: … of the … evaluations failed or gave incomplete data` | An Amber calculation of the linear model failed. `LSQ` keeps the start force field. Read `amber.MOL.log` (or the one in `lsq_particles/p_NNN`). |
+| `LSQ: unrecognised option(s)` | The only option is `--n_processes N`. |
 | `-ah …: the archive geometry of … and … differ by up to … the QM and force-field frames do not match` | The mol2 or the pdb is not in the frame of the `-gh` log. Usually it is a file from an earlier frequency job with a different input orientation. Build the mol2 from the archive geometry of that log. Delete the old pdb, because Q2MM makes the pdb again only when it does not exist (§4). |
 | `-ageig …: … differ by up to … the QM and force-field frames do not match` | The mol2 or the pdb is not in the frame of the normal modes. Usually the frequency job ran without `nosymm`. You then built the mol2 from the archive geometry. There are three solutions (§4, `--modes`). Use `--modes archive` on both lines. Or build the mol2 in the standard orientation of the log. Or run the frequency job again with `nosymm freq=hpmodes`. A pdb from an older mol2 also causes this error. Delete that pdb. |
 | `-ageig … uses --modes …, but -geigz read … with --modes …` | The `RDAT` and `CDAT` lines use different mode sources. Give the same `--modes` on both lines. |

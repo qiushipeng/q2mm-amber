@@ -20,8 +20,9 @@ This directory has three scripts:
 * GAFF2
 * optional custom parameters, inline or in a custom frcmod
 
-The THI example uses published NADH parameters. The builder does not change
-the input coordinates, atom names, connectivity or RESP charges.
+The example uses the published parameters of a cofactor (`COF`). The builder
+does not change the input coordinates, atom names, connectivity or RESP
+charges.
 
 ## Usage
 
@@ -58,10 +59,10 @@ for that source. The resolver never makes one term from types of different
 sources.
 
 The `published` source is the published frcmod overlay from the mapping
-file, plus its ff19SB dependency. In the THI example, `frcmod.NADH` wins for
-the published nicotinamide terms and for the nicotinamide/ribose boundary
-terms. For the usual ribose terms, the CSV report shows ff19SB as the source
-of the numbers.
+file, plus its ff19SB dependency. In the example, `frcmod.COF` wins for the
+published cofactor terms and for the terms at the boundary between the
+published part and the rest of the cofactor. For the usual terms of the
+rest, the CSV report shows ff19SB as the source of the numbers.
 
 The script rejects these terms:
 
@@ -87,8 +88,8 @@ The input is a plain text file with these sections:
 ```text
 [FILES]
 MOL2 molecule_resp.mol2
-PUBLISHED_LIB NADH.lib
-PUBLISHED_FRCMOD frcmod.NADH
+PUBLISHED_LIB COF.lib
+PUBLISHED_FRCMOD frcmod.COF
 FF19SB leaprc.protein.ff19SB
 GAFF2 leaprc.gaff2
 
@@ -100,27 +101,27 @@ gaff2
 
 [FF19SB_TEMPLATES]
 # library       residue unit  target anchor
-amino19.lib     HIP           C9
-amino19.lib     GLU           C22
-amino19.lib     LYS           N6
-amino19.lib     ASP           C25
+amino19.lib     HIP           C30
+amino19.lib     GLU           C40
+amino19.lib     LYS           N50
+amino19.lib     ASP           C60
 
 [TS_BONDS]
 # target atom names; both bonds remain covalent
-O4   H19   breaking
-H19  O7    forming
+O1   H1    breaking
+H1   O2    forming
 
 [CUSTOM_PARAMETERS]
 # section  exact final-type key  numerical values
-ANGLE AO-BH-OB 50.0000 171.8433
+ANGLE YO-YH-XO 50.0000 170.0000
 
 [ATOMS]
 # name category final_type source:type [source:type ...]
-C1  published    CF  published:CF
-C2  published    DC  published:CH
+C1  published    PA  published:PA
+C2  published    PB  published:PH
 C6  ff19sb  auto  published:CT ff19sb:auto
-C9  ff19sb  auto  ff19sb:auto
-C16 custom   QC  gaff2:c3
+C30 ff19sb  auto  ff19sb:auto
+C16 custom   QX  gaff2:c3
 C13 gaff2    original gaff2:original
 ```
 
@@ -144,30 +145,32 @@ The third column in `[ATOMS]` is an AMBER **atom type**, not a mol2 atom
 name. A custom final type changes the type label of the atom. The terms of
 that type then become independent parameters that Q2MM can optimize. By
 default, all initial parameters come from the declared aliases. For example,
-`O4 custom AO gaff2:oh` writes `AO` to the output mol2. Where no exact custom
-term exists, the builder uses the GAFF2 `oh` values. The atom name `O4` and
+`O1 custom YO gaff2:oh` writes `YO` to the output mol2. Where no exact custom
+term exists, the builder uses the GAFF2 `oh` values. The atom name `O1` and
 the RESP charge do not change.
 
 You can use `original` as a final type or as an alias. It expands to the
 type in the input mol2. `auto` for an ff19SB atom first uses a matched
 residue template. If the atom is outside those templates, the builder uses
-conservative rules for the saturated C, O and H environments that the ribose
-needs.
+conservative rules for saturated C, O and H environments, for example in a
+sugar ring.
 
-Aliases must be chemically intentional. These are examples from the THI
-mapping:
+Aliases must be chemically intentional. These are examples from the mapping
+above:
 
-* `DC` has `published:CH`. Thus the DC label in the figure is an exact alias
-  of the published CH type.
-* Ribose `C6` has `published:CT` and `ff19sb:auto`. Automatic environment
-  typing gives `CT` as the final type and as the ff19SB type. The published
-  alias lets the NADH boundary terms win.
-* Custom `QC` has `gaff2:c3`. This alias gives a parent for the initial
-  values where no exact custom QC term exists.
-* Custom `BC` and `OB` use `ff19sb:auto`. The GLU template match sets their
-  parent aliases to `CO` and `O2`. Their final custom names do not change.
+* `PB` has `published:PH`. Thus the PB label in the figure is an exact alias
+  of the published PH type.
+* `C6`, a saturated carbon at the boundary of the published part, has
+  `published:CT` and `ff19sb:auto`. Automatic environment typing gives `CT`
+  as the final type and as the ff19SB type. The published alias lets the
+  published boundary terms win.
+* Custom `QX` has `gaff2:c3`. This alias gives a parent for the initial
+  values where no exact custom QX term exists.
+* Custom `XC` and `XO`, on a Glu side chain, use `ff19sb:auto`. The GLU
+  template match sets their parent aliases to `CO` and `O2`. Their final
+  custom names do not change.
 
-The builder graph-matches `NADH.lib` against the mol2 and checks each
+The builder graph-matches `COF.lib` against the mol2 and checks each
 declared `published:` alias. This check finds a published type on the wrong
 atom. It does not change the RESP charges in the mol2.
 
@@ -186,8 +189,8 @@ The supported section names and value columns are:
 | `DIHE` | `TYPE-TYPE-TYPE-TYPE idivf barrier phase periodicity` |
 | `IMPROPER` | `TYPE-TYPE-TYPE-TYPE barrier phase periodicity` |
 
-The O-H-O example above replaces only `AO-BH-OB`. Other terms that contain
-AO, BH or OB still get their parameters through their aliases. To give more
+The O-H-O example above replaces only `YO-YH-XO`. Other terms that contain
+YO, YH or XO still get their parameters through their aliases. To give more
 than one Fourier term, write more than one `DIHE` row. If an inline custom
 bonded term spans a declared `[TS_BONDS]` pair, the TS fit report includes
 it.
@@ -197,8 +200,8 @@ it.
 Each row gives an Amber library, a residue unit, and one unique atom name in
 the target mol2. The anchor selects the correct fragment. The graph matcher
 assigns the atom types of the residue. The atom names and the atom numbers do
-not have to agree. For example, `HIP C9` assigns
-`CC/CW/CR/NA/H/H4/H5/CT/HC` across the truncated His 381 fragment. The Glu,
+not have to agree. For example, `HIP C30` assigns
+`CC/CW/CR/NA/H/H4/H5/CT/HC` across a truncated histidine fragment. The Glu,
 Lys and Asp rows work in the same way. The run log reports, for each residue
 template, the number of heavy atoms and the total number of atoms that it
 matched.
@@ -219,22 +222,22 @@ silent loss of the bond to a two-coordinate hydride.
 
 ## Outputs
 
-For `-o THI.figure`, the script writes these files:
+For `-o MOL`, the script writes these files:
 
 | File | Purpose |
 |---|---|
-| `THI.figure.mol2` | the molecule with the final atom types and the unchanged RESP charges |
-| `THI.figure.leap.mol2` | a LEaP loading copy. The builder writes it when a transferring H with two bonds needs its forming bond back after loading. |
-| `THI.figure.frcmod` | all parameters that this topology needs. It has no Q2MM header (refer to "Next step"). |
-| `THI.figure_atomtypes.leap` | LEaP definitions (`addAtomTypes`) for each final type in the topology. The generated LEaP inputs do not load this file (refer to the note below). |
-| `THI.figure_parameter_report.csv` | the source, source file, aliases, values, region and atom instances of each parameter in the frcmod |
-| `THI.figure_ts_seed_report.csv` | the generated TS seed terms. Q2MM must optimize them. |
-| `THI.figure_ts_fit_report.csv` | the breaking and forming bonds, the inline reaction-center overrides, and the coupled seed terms. Select these terms for the Q2MM fit. |
-| `THI.figure_atom_report.csv` | the input type, final type, category, aliases, assignment method and charge of each atom |
-| `THI.figure.leap.in` | the production LEaP input. It loads GAFF2, ff19SB and the generated frcmod, with absolute paths. |
-| `THI.figure.standalone.leap.in` | the completeness check. It loads only the generated frcmod, without GAFF2 or ff19SB. |
-| `THI.figure.prmtop`, `THI.figure.inpcrd` | the topology and coordinates from the production LEaP check |
-| `THI.figure.standalone.prmtop`, `THI.figure.standalone.inpcrd` | the topology and coordinates from the standalone check |
+| `MOL.mol2` | the molecule with the final atom types and the unchanged RESP charges |
+| `MOL.leap.mol2` | a LEaP loading copy. The builder writes it when a transferring H with two bonds needs its forming bond back after loading. |
+| `MOL.frcmod` | all parameters that this topology needs. It has no Q2MM header (refer to "Next step"). |
+| `MOL_atomtypes.leap` | LEaP definitions (`addAtomTypes`) for each final type in the topology. The generated LEaP inputs do not load this file (refer to the note below). |
+| `MOL_parameter_report.csv` | the source, source file, aliases, values, region and atom instances of each parameter in the frcmod |
+| `MOL_ts_seed_report.csv` | the generated TS seed terms. Q2MM must optimize them. |
+| `MOL_ts_fit_report.csv` | the breaking and forming bonds, the inline reaction-center overrides, and the coupled seed terms. Select these terms for the Q2MM fit. |
+| `MOL_atom_report.csv` | the input type, final type, category, aliases, assignment method and charge of each atom |
+| `MOL.leap.in` | the production LEaP input. It loads GAFF2, ff19SB and the generated frcmod, with absolute paths. |
+| `MOL.standalone.leap.in` | the completeness check. It loads only the generated frcmod, without GAFF2 or ff19SB. |
+| `MOL.prmtop`, `MOL.inpcrd` | the topology and coordinates from the production LEaP check |
+| `MOL.standalone.prmtop`, `MOL.standalone.inpcrd` | the topology and coordinates from the standalone check |
 
 If you do not give `--no-verify`, both LEaP inputs must finish with zero
 errors. The standalone run shows that the frcmod contains each numerical
@@ -242,14 +245,15 @@ parameter that this mol2 uses. LEaP can show a close-contact warning for a
 TS geometry. This warning can be physically correct.
 
 > **Note: the atom-types file.** The two generated LEaP inputs do not load
-> `THI.figure_atomtypes.leap`. Thus tleap does not know the elements of the
+> `MOL_atomtypes.leap`. Thus tleap does not know the elements of the
 > custom atom types. It gives them no element, or a wrong element, in the
-> prmtop. For example, the THI model gets boron for `BC` and `BH`. tleap sets
+> prmtop. For example, a custom type whose name starts with `B`, such as
+> `BX`, gets boron. tleap sets
 > the GB radius and the GB screening factor of each atom from its element. The
 > Q2MM fit uses these values in its GB electrostatics. For a QM reference in a
 > solvent (ε > 1), wrong elements give wrong Born radii. QM/MM and other
 > element-based tools also use the elements. To get the correct elements, put
-> `source THI.figure_atomtypes.leap` after the two `source leaprc` lines.
+> `source MOL_atomtypes.leap` after the two `source leaprc` lines.
 > Refer to [`OPTIMIZATION.md`](../OPTIMIZATION.md) §2 and §4.
 
 ## TS seeds (`--allow-ts-seeds`)
@@ -257,8 +261,9 @@ TS geometry. This warning can be physically correct.
 Use `--allow-ts-seeds` for an initial TSFF with unsupported terms that
 involve custom atoms.
 
-* Terms with a GAFF2 parent still get the GAFF2 values. For the THI model,
-  `AO-BH` and `BH-OB` both get the `ho-oh` bond values.
+* Terms with a GAFF2 parent still get the GAFF2 values. For example, if the
+  GAFF2 parents of a transferring H and of its two O neighbours are `ho` and
+  `oh`, both of its bonds (`YO-YH` and `YH-XO`) get the `ho-oh` bond values.
 * If an angle has no source parameter, its equilibrium angle comes from the
   input TS geometry. Its initial force constant is 50 kcal/mol/rad².
 * An unsupported proper torsion gets a zero barrier.
@@ -297,8 +302,8 @@ because the fit has no other way to absorb it.
    header, Q2MM reads 0 parameters and gives no error.
 2. Write the tleap script `MOL.in` for the fit. It must save `calc/prmtop`
    and `calc/inpcrd`, and it must use relative file names. Do not use
-   `THI.figure.leap.in` without changes, because it uses absolute paths.
-   Put `source THI.figure_atomtypes.leap` after the two `source leaprc`
+   `MOL.leap.in` without changes, because it uses absolute paths.
+   Put `source MOL_atomtypes.leap` after the two `source leaprc`
    lines (refer to the note above).
 3. If the builder wrote a `.leap.mol2`, copy its `loadmol2` line into
    `MOL.in`. Also copy the `set … pert` and `bond` lines after it.
@@ -369,7 +374,7 @@ stage-2 term, and one less:
 
 ```bash
 python compare_qfuerza.py MOL.frcmod MOL_qf_raw.frcmod MOL_qf_inv.frcmod \
-    -a MOL_atom_report.csv --stage2-min 0.5 --stage2-add AC-HT-DC \
+    -a MOL_atom_report.csv --stage2-min 0.5 --stage2-add YC-YH-XC \
     --stage2-remove 87 -o MOL_selection.csv
 ```
 
@@ -383,7 +388,7 @@ python compare_qfuerza.py MOL.frcmod MOL_qf_raw.frcmod MOL_qf_inv.frcmod \
 | `--stage1-min PERCENT` | put in stage 1 only the custom-type terms whose estimate (the inverted estimate, if given) differs from the current value by PERCENT or more. The default is 0: all custom-type terms. |
 | `--stage2-min VALUE` | the smallest \|inverted − raw\| of a stage-2 term. The default is 1. |
 | `--stage2-units` | the units of `--stage2-min`: `mdyn` (mdyn/Å or mdyn·Å/rad², the default), `frcmod` (kcal/mol/Å² or kcal/mol/rad²) or `percent` (of the inverted estimate). 1 mdyn/Å is 71.97 kcal/mol/Å² in frcmod units. |
-| `--stage2-add TERM ...` | put these terms in stage 2 for all criteria. A term is a frcmod row number, or atom types such as `AC-HT-DC` in either direction. |
+| `--stage2-add TERM ...` | put these terms in stage 2 for all criteria. A term is a frcmod row number, or atom types such as `YC-YH-XC` in either direction. |
 | `--stage2-remove TERM ...` | keep these terms out of stage 2 for all criteria |
 | `-o`, `--out` | the output CSV. The default is standard output. |
 

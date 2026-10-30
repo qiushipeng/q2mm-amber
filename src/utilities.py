@@ -1443,12 +1443,17 @@ class AmberUtilities(object):
 
     # Positional restraints that hold atoms at the reference coordinates in
     # the minimization. sander's belly option would freeze them outright, but
-    # with GB (igb > 0) it needs the moving atoms first in the topology. At
-    # this weight the restrained atoms of a 98-atom theozyme moved < 0.004 A
-    # in 700 cycles and the minimizer still converged; 1e5 stalled it.
+    # with GB (igb > 0) it needs the moving atoms first in the topology. In a
+    # test at this weight the restrained atoms moved < 0.004 A in 700 cycles
+    # and the minimizer still converged; 1e5 stalled it.
     RESTRAINT_WT = 1000.0      # kcal/mol/A^2
     # sander stops with an error on an atom mask longer than this.
     MAX_MASK_LENGTH = 255
+
+    # render_frcmod skips a value above this (keeps the row as it is), and
+    # writes each parameter type with this many decimals.
+    MAX_FRCMOD_VALUE = 1999.0
+    FRCMOD_DECIMALS = {"bf": 4, "be": 4, "af": 4, "ae": 4, "df": 5, "imp1": 5}
 
     SANDER_TRAJ = """Comments
  &cntrl
@@ -1650,14 +1655,14 @@ nmode( x, 3*m.natoms, mme2, 0, 0, 0.0, 0.0, 0);"""
         for param in params:
             logger.log(logging.DEBUG, ">>> param: {} param.value: {}".format(param, param.value))
             line = lines[param.ff_row - 1]
-            if abs(param.value) > 1999.0:
+            if abs(param.value) > AmberUtilities.MAX_FRCMOD_VALUE:
                 logger.warning("Value of {} is too high! Skipping write.".format(param))
                 continue
             atoms = ""
             const = ""
             space3 = " " * 3
             col = int(param.ff_col - 1)
-            value = "{:7.4f}".format(param.value)
+            value = "{:7.{}f}".format(param.value, AmberUtilities.FRCMOD_DECIMALS["bf"])
             AA = None
             BB = None
             if param.ptype in ("bf", "be"):
@@ -1686,7 +1691,7 @@ nmode( x, 3*m.natoms, mme2, 0, 0, 0.0, 0.0, 0);"""
                 AA = line[:nl].split("-")
                 BB = line[nl:].split()
                 atoms = "-".join([format(el, "<2") for el in AA]) + space3 * 2
-                value = "{:7.5f}".format(param.value)
+                value = "{:7.{}f}".format(param.value, AmberUtilities.FRCMOD_DECIMALS[param.ptype])
                 if param.ptype == "imp1":
                     atoms += space3
                     BB[0] = value
