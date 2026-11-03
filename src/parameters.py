@@ -12,10 +12,22 @@ Format of the parameter file (same as the old codebase):
     ff_row ff_col [neg|pos|both | min_value max_value]
 
     ff_row  Integer line number of the parameter in the .frcmod / .fld.
-    ff_col  Column within that line (1, 2, 3) depending on parameter type.
-            For an AMBER bond row, col 1 is the force constant, col 2 is
-            the equilibrium length; for an angle row similarly; for a
-            torsion the cols are V1, V2, V3.
+    ff_col  Which value of that line to fit: the number the reader gives
+            each value it can fit, not a text column of the line.
+
+            frcmod section  ff_col 1                ff_col 2
+            BOND            bf, force constant      be, equilibrium length
+            ANGL            af, force constant      ae, equilibrium angle
+            DIHE            df, PK                  -
+            IMPROPER        imp1, PK                -
+
+            A DIHE line holds one Fourier term, so each term of a torsion
+            is a separate line and a separate parameter. IDIVF, PHASE and
+            PN are never fitted. In an MM3* .fld record, ff_col is the
+            position of the number instead: bond 1 = be, 2 = bf, 3 = q
+            (bond dipole); angle 1 = ae, 2 = af; torsion 1, 2, 3 = df
+            (V1, V2, V3). A row and column that match no parameter select
+            nothing, and no warning is given.
     neg     Forces the parameter into negative-only values.
     pos     Forces the parameter into positive-only values.
     both    Allows both positive and negative.

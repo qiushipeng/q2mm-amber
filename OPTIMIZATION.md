@@ -233,9 +233,29 @@ ff_row  ff_col  [lower upper | neg | pos | both]
 ```
 
 * `ff_row`: the line number in the frcmod
-* `ff_col`: **1 = force constant, 2 = equilibrium value**
+* `ff_col`: the value in that line to fit. Q2MM gives this number to each
+  value that it can fit. It is not the position of the number in the line.
+  The table below gives `ff_col` for each section of the frcmod.
 * bounds: a finite `lower upper` pair, or one keyword. `neg` is −∞ to 0,
   `pos` is 0 to ∞, and `both` is −∞ to ∞.
+
+| frcmod section | `ff_col` 1 | `ff_col` 2 |
+|---|---|---|
+| `BOND` | `bf`, force constant | `be`, equilibrium length |
+| `ANGL` | `af`, force constant | `ae`, equilibrium angle |
+| `DIHE` | `df`, PK | none |
+| `IMPROPER` | `imp1`, PK | none |
+
+Amber calculates the energy of one torsion term as
+(PK/IDIVF)·[1 + cos(PN·φ − PHASE)]. Q2MM fits only PK. IDIVF, PHASE and PN
+keep their frcmod values. Each `DIHE` line holds one term. Thus a torsion
+with three terms needs three lines in the parameter file, each with
+`ff_col` 1. An `IMPROPER` line has no IDIVF.
+
+**A wrong `ff_row` or `ff_col` selects nothing, and Q2MM gives no warning.**
+For example, `ff_col` 3 on a `DIHE` line selects nothing. Compare the line
+`Trimmed number of parameters down to N` in `root.log` with the number of
+parameter lines in the file.
 
 A line without bounds gets the default range of its parameter type: 0 to ∞,
 or −∞ to ∞ for `df` and `q`.
@@ -247,6 +267,11 @@ or −∞ to ∞ for `df` and `q`.
 # angle force constants
 104 1 1 250
 105 1 1 250
+# torsion PK: one line for each term
+163 1 0 10
+164 1 0 10
+# improper PK
+212 1 0 20
 ```
 
 **Select each term in `MOL_ts_fit_report.csv` and in
@@ -950,7 +975,7 @@ the stored values makes them different.
 
 | column | meaning |
 |---|---|
-| `ff_row`, `ff_col` | the line and the column of the parameter in the frcmod |
+| `ff_row`, `ff_col` | the frcmod line of the parameter and its `ff_col` (§3) |
 | `ptype` | the parameter type (`bf`, `af`, `df`, `imp1`) |
 | `atom_types` | the atom types of the term |
 | `start` | the start value, as the frcmod stores it |

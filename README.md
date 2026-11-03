@@ -118,8 +118,10 @@ grep -n -m3 '^#' MOL.frcmod
 
 **3. Select the parameters to fit** (`params.txt`). Write one parameter on
 each line: `ff_row ff_col lower upper`. `ff_row` is the line number in the
-frcmod. `ff_col` is `1` for a force constant and `2` for an equilibrium
-value. `HYBR` needs **finite** bounds:
+frcmod. `ff_col` is `1` for a force constant or for the PK of a `DIHE` or
+`IMPROPER` line, and `2` for the equilibrium value of a bond or an angle.
+Refer to [`OPTIMIZATION.md` §3](OPTIMIZATION.md). `HYBR` needs **finite**
+bounds:
 
 ```
 49 1 10 1500
