@@ -786,11 +786,40 @@ def frc_sections(text):
 
 
 
+def flag_dihe_terms(key, records):
+    """The terms of one DIHE key with Amber's multi-term flag on PN.
+
+    A negative PN means "another term of this torsion follows"; the last term
+    has a positive PN. Published files do not always follow this (the NADH
+    frcmod gives every term a positive PN). tleap keeps all the terms anyway,
+    but a reader that follows the format, such as ParmEd, keeps only the last
+    one. Only the sign of the PN text changes. A term that cannot carry the
+    flag stops the build instead of being written as a different torsion."""
+    flagged = []
+    for i, (numbers, comment, raw) in enumerate(records):
+        last = i == len(records) - 1
+        if len(numbers) not in EXPECTED_NUMBERS["DIHE"]:
+            if len(records) > 1:
+                raise ValueError("DIHE {}: the term '{}' does not have 4 numbers, "
+                                 "so its PN cannot be marked".format(key.strip(),
+                                                                     raw.strip()))
+            flagged.append((numbers, comment, raw))   # passed through as it came in
+            continue
+        pn = numbers[3].lstrip("+-")
+        if not last and float(pn) == 0.0:
+            raise ValueError("DIHE {}: a PN of 0 cannot mark that another term "
+                             "follows".format(key.strip()))
+        flagged.append((numbers[:3] + [pn if last else "-" + pn], comment, raw))
+    return flagged
+
+
 def frc_write(path, title, sections, extras=()):
     out = [title]
     for section in FRC_SECTIONS:
         out.append(section)
         for key, records in sections[section].items():
+            if section == "DIHE":
+                records = flag_dihe_terms(key, records)
             for numbers, comment, raw in records:
                 out.append(frc_render(section, key, numbers, comment, raw))
         out.append("")
