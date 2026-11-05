@@ -40,6 +40,7 @@ The script finds `tleap` and `parmchk2` in `$AMBERHOME/bin`, or on `PATH`.
 | `--no-verify` | write the outputs, but do not run `tleap` |
 | `--allow-ts-seeds` | make flagged initial angle and torsion seeds when a custom TS term has no source parameter (refer to "TS seeds") |
 | `--ts-equilibria` | take the equilibrium values of the reaction-center bonds and angles from the input TS geometry (refer to "TS equilibria") |
+| `--add-missing-impropers [gaff2\|custom]` | add an improper at each planar center that no source covers. `gaff2`, the value when you give the option alone, writes the GAFF2 row. `custom` stops until `[CUSTOM_PARAMETERS]` has a row for each center. Without this option, the builder only warns (refer to "Missing impropers"). |
 
 ## Resolution rules
 
@@ -70,8 +71,8 @@ The script rejects these terms:
 * `parmchk2` rows marked `ATTN, need revision`. Those zero values are
   diagnostics, not parameters.
 
-The builder includes an improper torsion only when a source matches it. It
-does not infer an improper only because an atom has three neighbours.
+The builder includes an improper torsion when a source matches it. For a
+three-bonded center that no source covers, refer to "Missing impropers".
 
 Without `--allow-ts-seeds`, each unsupported term is an error, and the
 builder makes no new terms from the TS geometry. With that option, the
@@ -241,7 +242,9 @@ For `-o MOL`, the script writes these files:
 
 If you do not give `--no-verify`, both LEaP inputs must finish with zero
 errors. The standalone run shows that the frcmod contains each numerical
-parameter that this mol2 uses. LEaP can show a close-contact warning for a
+parameter that this mol2 uses. The builder also checks the impropers of each
+prmtop. Each improper of the frcmod must be on the expected atoms, in the
+atom order of its row, and the prmtop must have no other improper. LEaP can show a close-contact warning for a
 TS geometry. This warning can be physically correct.
 
 > **Note: the atom-types file.** The two generated LEaP inputs do not load
@@ -291,6 +294,70 @@ Use this option when a Q2MM step fits only force constants to the TS
 Hessian. A ground-state reference value puts strain on its term at the TS.
 The bond tension in the MM Hessian then goes into distorted force constants,
 because the fit has no other way to absorb it.
+
+## Missing impropers (`--add-missing-impropers`)
+
+An improper comes from a source only when that source has a matching row.
+Thus a published frcmod without an `IMPROPER` section gives no improper to
+its planar atoms. The builder finds these centers with GAFF2. A center is
+missing an improper when all of these are true:
+
+* It has exactly three bonds in the TS topology.
+* No declared source and no `[CUSTOM_PARAMETERS]` row has an improper for
+  it.
+* GAFF2 has an improper for the GAFF2 types of the input mol2: `gaff2.dat`
+  or the `parmchk2` run of the builder. They have rows only for the
+  three-bonded sp2 types that `parmchk2` marks for impropers.
+
+The option sets what the builder does with these centers:
+
+| Option | Result |
+|---|---|
+| (not given) | The builder adds no improper and prints a warning that lists the centers. The outputs do not change. |
+| `--add-missing-impropers` or `--add-missing-impropers gaff2` | The builder writes the GAFF2 row of each center. |
+| `--add-missing-impropers custom` | The builder adds no GAFF2 value. It stops and lists each center that has no `[CUSTOM_PARAMETERS]` row. |
+
+For each center, the list gives the GAFF2 row and its values, the final
+types and the atom names in the order of that row, the distance from planar
+in the input geometry, and the comment of the row. For a `parmchk2` row, the
+comment gives the analogy and its penalty score.
+
+With `gaff2`:
+
+* The builder writes the row with the final types, in the atom order of the
+  GAFF2 row. A `parmchk2` row lists its three outer types in alphabetical
+  order. The atom in position 2 sets the axis of an improper. Thus this
+  order can differ from the order of a `parm19.dat` row with the same PK,
+  and the same PK can then give a different stiffness.
+* The parameter report gives the row the status `generated_improper` and
+  the source `gaff2`. Its `earlier_attempts` column gives the GAFF2 types
+  and the comment of the row. The frcmod title records the option.
+* The builder stops at a center in `[TS_BONDS]`. Give the improper of that
+  center in `[CUSTOM_PARAMETERS]`, with a PK of 0 for no improper.
+* An atom with four bonds gets no improper, as before.
+* Examine each analogy with a high penalty. For example, `parmchk2` can
+  copy `X -X -cc-X` (PK 10.5) to an aromatic `ca` carbon whose hydrogen is
+  `h4`. The GAFF2 row for `ca` with `ha` (`X -X -ca-ha`) has a PK of 1.1.
+
+To give your own value, write the row in `[CUSTOM_PARAMETERS]`. A custom row
+always comes before a GAFF2 row:
+
+```text
+[CUSTOM_PARAMETERS]
+# carbonyl C (QC), O (QO) in position 4, as X -X -C -O of parm19.dat
+IMPROPER QN-QA-QC-QO 10.5 180.0 2.0
+```
+
+* Put the center in position 3.
+* To transfer a standard PK, use the order that LEaP gives the source row.
+  The typed atoms of the row stay in their positions, and the X positions
+  take their atoms in atom-index order.
+* LEaP applies the row to each center whose types fit it.
+
+`_ts_seed_report.csv` never lists an improper. `_ts_fit_report.csv` lists
+an improper only when it is an inline custom row that contains both atoms of
+a `[TS_BONDS]` pair. Thus a parameter file made from those reports keeps
+each other improper fixed at its built value.
 
 ## Next step: prepare the fit
 

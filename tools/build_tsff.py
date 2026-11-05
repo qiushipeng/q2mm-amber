@@ -22,7 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 
 # ---------------------------------------------------------------------------
 # mol2
@@ -144,6 +144,30 @@ def angle_degrees(a, b, c):
 def bond_length(a, b):
     """Return the a-b distance for two Cartesian coordinates."""
     return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+
+def dihedral_degrees(a, b, c, d):
+    """Return the a-b-c-d dihedral angle in degrees, from -180 to 180.
+
+    The sign follows IUPAC: positive when, seen along b->c, the near bond
+    b-a turns clockwise to cover the far bond c-d. An improper is the
+    dihedral of its four atoms in row order (center third). It is 0 or 180
+    when the four atoms lie in one plane.
+    """
+    b1 = tuple(y - x for x, y in zip(a, b))
+    b2 = tuple(y - x for x, y in zip(b, c))
+    b3 = tuple(y - x for x, y in zip(c, d))
+
+    def cross(u, v):
+        return (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0])
+
+    n1, n2 = cross(b1, b2), cross(b2, b3)
+    if not any(n1) or not any(n2):
+        raise ValueError("a dihedral with three collinear atoms is undefined")
+    y = math.sqrt(sum(v * v for v in b2)) * sum(p * q for p, q in zip(b1, n2))
+    x = sum(p * q for p, q in zip(n1, n2))
+    return math.degrees(math.atan2(y, x))
 
 
 def measured_equilibrium(section, instances, coords):
@@ -1307,6 +1331,57 @@ def validate_prmtop_bonds(path, expected_bonds):
                                                  describe(extra)))
 
 
+def validate_prmtop_impropers(path, expected_impropers):
+    """Require the saved topology to hold exactly the expected impropers.
+
+    expected_impropers has one (i, j, k, l) tuple of 1-based mol2 atom
+    indices per improper, in the atom order of its frcmod row (center third).
+    LEaP gives a row to every center whose types fit it, keeps the atom order
+    of the row, and reads its numbers from column 16 on. So a row that also
+    fits another center, another atom order or a lost row would change the
+    force field without an error. In the prmtop a negative fourth index
+    marks an improper. LEaP can write a dihedral in reverse order to keep
+    atom 1 (index 0) out of positions 3 and 4; the reverse order has the
+    same angle, so it counts as the same improper.
+    """
+    sections, current = {}, None
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith("%FLAG "):
+                current = line.split(None, 1)[1].strip()
+                sections[current] = []
+            elif line.startswith("%FORMAT"):
+                continue
+            elif current is not None:
+                sections[current].append(line)
+
+    actual = []
+    for section in ("DIHEDRALS_INC_HYDROGEN", "DIHEDRALS_WITHOUT_HYDROGEN"):
+        values = [int(value) for line in sections.get(section, [])
+                  for value in line.split()]
+        if len(values) % 5:
+            raise ValueError("{} has a malformed {} section"
+                             .format(path, section))
+        for offset in range(0, len(values), 5):
+            atoms = values[offset:offset + 4]
+            if atoms[3] < 0:
+                actual.append(tuple(abs(value) // 3 + 1 for value in atoms))
+    same_angle = lambda quad: min(tuple(quad), tuple(quad)[::-1])
+    expected = Counter(same_angle(quad) for quad in expected_impropers)
+    found = Counter(same_angle(quad) for quad in actual)
+    missing, extra = expected - found, found - expected
+    if missing or extra:
+        # Show each improper in the order of the frcmod row, or as stored.
+        shown = dict((same_angle(quad), tuple(quad)) for quad in actual)
+        shown.update((same_angle(quad), tuple(quad)) for quad in expected_impropers)
+        describe = lambda quads: ", ".join(
+            "-".join(str(i) for i in shown[quad])
+            for quad in sorted(quads.elements())) or "none"
+        raise ValueError("{} impropers differ from the frcmod rows; missing: "
+                         "{}; extra: {}".format(path, describe(missing),
+                                                 describe(extra)))
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -1328,6 +1403,16 @@ def main(argv=None):
                          "reaction-center bond and angle (every instance "
                          "involves a custom atom) from the input TS "
                          "geometry; force constants keep their source values")
+    ap.add_argument("--add-missing-impropers", nargs="?", const="gaff2",
+                    choices=("gaff2", "custom"),
+                    help="give an improper to every three-bonded center that "
+                         "GAFF2 gives one (for the input mol2 types) but no "
+                         "declared source covers. gaff2, the value when the "
+                         "option is given alone, writes the GAFF2 row; custom "
+                         "accepts only [CUSTOM_PARAMETERS] rows and stops "
+                         "with a list of the centers that have none. Without "
+                         "this option no improper is added, and that list is "
+                         "printed as a warning")
     opts = ap.parse_args(argv)
 
     config_path = os.path.abspath(opts.mapping)
@@ -1569,6 +1654,9 @@ def main(argv=None):
         # parmchk2 is part of the GAFF2 source. DU atoms are replaced only in
         # this temporary copy, using their explicitly declared GAFF2 alias.
         gaff_lines = list(lines)
+        # The GAFF2 type of each atom as parmchk2 sees it. The missing-improper
+        # check below looks GAFF2 up with these same types.
+        gaff_input_types = dict(types)
         for idx in sorted(atom_tokens):
             if types[idx].upper() not in ("DU", "DUMMY"):
                 continue
@@ -1578,6 +1666,7 @@ def main(argv=None):
                          "parmchk2".format(atom_tokens[idx][1]))
             li = atom_line_idx[idx]
             gaff_lines[li] = set_mol2_type_inplace(gaff_lines[li], alias)
+            gaff_input_types[idx] = alias
         gaff_mol2 = os.path.join(workdir, "all_gaff.mol2")
         with open(gaff_mol2, "w") as fh:
             fh.write("\n".join(gaff_lines) + "\n")
@@ -1704,7 +1793,9 @@ def main(argv=None):
         prefixes = {"MASS": "M", "BOND": "B", "ANGLE": "A", "DIHE": "D",
                     "IMPROPER": "I", "NONBON": "LJ"}
 
-        def save_resolution(section, atom_ids, output_types, source, hit, attempts):
+        def save_resolution(section, atom_ids, output_types, source, hit, attempts,
+                            status=None):
+            # status, when given, replaces the status derived from the source.
             matched, records, origin = hit
             identity = canonical_term(section, output_types)
             existing = resolved[section].get(identity)
@@ -1735,10 +1826,11 @@ def main(argv=None):
                 if any(set(ts_pair).issubset(atom_set)
                        for ts_pair in ts_bond_roles):
                     ts_role = "coupled_{}_custom".format(section.lower())
-            status = ("generated_ts_seed" if source == "ts_seed" else
-                      "custom_override" if source == "custom" else
-                      "ts_initial_{}".format(ts_role) if ts_role else
-                      "published" if source == "published" else "inherited")
+            if status is None:
+                status = ("generated_ts_seed" if source == "ts_seed" else
+                          "custom_override" if source == "custom" else
+                          "ts_initial_{}".format(ts_role) if ts_role else
+                          "published" if source == "published" else "inherited")
             row = OrderedDict([
                 ("parameter_id", "{}{:03d}".format(prefixes[section],
                                                     counters[section])),
@@ -1796,8 +1888,13 @@ def main(argv=None):
                                     tuple(otype[x] for x in atom_ids), source,
                                     hit, attempts)
 
-        # An improper is emitted only when a source explicitly has a matching
-        # improper for a three-neighbour center. No planarity term is invented.
+        # An improper comes from a declared source when one has a matching row
+        # for a three-neighbour center. A center that no declared source covers
+        # is missing an improper when GAFF2 has a row for the GAFF2 types of
+        # the input mol2: gaff2.dat and the parmchk2 run above have rows only
+        # for the three-bonded sp2 types that parmchk2 marks for impropers.
+        # --add-missing-impropers decides what happens to those centers.
+        missing_impropers = []
         for center in sorted(atom_tokens):
             neighbors = tuple(adj[center])
             if len(neighbors) != 3:
@@ -1840,6 +1937,63 @@ def main(argv=None):
                 save_resolution("IMPROPER", atoms_order,
                                 tuple(otype[x] for x in atoms_order), source, hit,
                                 attempts)
+                continue
+            gaff_hit = dbs["gaff2"].lookup_improper(
+                center, neighbors,
+                dict((idx, gaff_input_types[idx]) for idx in (center,) + neighbors))
+            if gaff_hit is None:
+                continue
+            missing_impropers.append((center, gaff_hit))
+            # A TS-bond atom is not given a planar term without a decision:
+            # the build stops below and lists it.
+            if opts.add_missing_impropers == "gaff2" and center not in ts_bond_atoms:
+                atoms_order, matched, records, origin = gaff_hit
+                attempts.append("generated from the input mol2 GAFF2 types "
+                                "{} ({})".format(
+                                    "-".join(gaff_input_types[i] for i in atoms_order),
+                                    records[0][1] or "no source comment"))
+                save_resolution("IMPROPER", atoms_order,
+                                tuple(otype[x] for x in atoms_order), "gaff2",
+                                (matched, records, origin), attempts,
+                                status="generated_improper")
+
+        def describe_missing_improper(center, gaff_hit):
+            """One line about a center that no declared source covers."""
+            atoms_order, matched, records, _origin = gaff_hit
+            phi = abs(dihedral_degrees(*[coords[i] for i in atoms_order]))
+            return ("{} ({}){}: GAFF2 {} {} as {} on {}, {:.1f} deg from "
+                    "planar in the input geometry; {}".format(
+                        atom_tokens[center][1], otype[center],
+                        ", TS-bond atom" if center in ts_bond_atoms else "",
+                        "-".join(matched),
+                        " | ".join(" ".join(record[0]) for record in records),
+                        "-".join(otype[i] for i in atoms_order),
+                        "-".join(atom_tokens[i][1] for i in atoms_order),
+                        min(phi, 180.0 - phi),
+                        records[0][1] or "no source comment"))
+
+        missing_lines = [describe_missing_improper(center, hit)
+                         for center, hit in missing_impropers]
+        if opts.add_missing_impropers == "custom" and missing_impropers:
+            raise ValueError(
+                "--add-missing-impropers custom: {} center(s) have no improper "
+                "from a declared source or [CUSTOM_PARAMETERS], but GAFF2 gives "
+                "one for the input mol2 types:\n  {}\nAdd an IMPROPER row for "
+                "each to [CUSTOM_PARAMETERS], with the center in position 3, "
+                "or use --add-missing-impropers gaff2".format(
+                    len(missing_lines), "\n  ".join(missing_lines)))
+        ts_missing = [line for (center, _), line in
+                      zip(missing_impropers, missing_lines)
+                      if center in ts_bond_atoms]
+        if opts.add_missing_impropers == "gaff2" and ts_missing:
+            raise ValueError(
+                "--add-missing-impropers gaff2 does not put a planar improper "
+                "on a TS-bond atom:\n  {}\nGive the improper of each in "
+                "[CUSTOM_PARAMETERS] (a PK of 0 for none)".format(
+                    "\n  ".join(ts_missing)))
+        expected_impropers = [tuple(int(i) for i in instance.split(","))
+                              for entry in resolved["IMPROPER"].values()
+                              for instance in entry["row"]["atom_indices"].split(";")]
 
         # A reaction-center bond or angle keeps its source force constant but
         # takes the equilibrium value measured in the input TS geometry, so a
@@ -1914,6 +2068,8 @@ def main(argv=None):
             title += "; flagged TS seeds enabled"
         if opts.ts_equilibria:
             title += "; reaction-center equilibria from TS geometry"
+        if opts.add_missing_impropers:
+            title += "; missing impropers: {}".format(opts.add_missing_impropers)
         total = frc_write(out_frcmod, title, output_sections)
         known_types = dict(gaff_type_defs)
         known_types.update(amber_type_defs)
@@ -2004,6 +2160,21 @@ def main(argv=None):
                              "from the TS geometry\n".format(
                                  sum(r["section"] == "BOND" for r in ts_equilibria),
                                  sum(r["section"] == "ANGLE" for r in ts_equilibria)))
+        if missing_impropers and opts.add_missing_impropers == "gaff2":
+            sys.stderr.write("  GAFF2 impropers added at {} center(s) that no "
+                             "declared source covers:\n"
+                             .format(len(missing_lines)))
+            for line in missing_lines:
+                sys.stderr.write("    {}\n".format(line))
+        elif missing_impropers:
+            assert opts.add_missing_impropers is None   # custom stopped above
+            sys.stderr.write("WARNING: {} center(s) have no improper. No "
+                             "declared source covers them, but GAFF2 gives one "
+                             "for the input mol2 types. Use "
+                             "--add-missing-impropers [gaff2|custom] to add "
+                             "them:\n".format(len(missing_lines)))
+            for line in missing_lines:
+                sys.stderr.write("    {}\n".format(line))
         sys.stderr.write("wrote {} ({} atom types used by this topology)\n"
                          .format(out_atomtypes, len(definitions)))
         sys.stderr.write("wrote {} (parameter provenance)\n".format(out_report))
@@ -2026,6 +2197,7 @@ def main(argv=None):
             sys.stderr.write("\ntleap: Errors = {}; Warnings = {}\n"
                              .format(errors, warnings))
             validate_prmtop_bonds(out_prmtop, bonds)
+            validate_prmtop_impropers(out_prmtop, expected_impropers)
             returncode, errors, warnings, log = run_generated_tleap(
                 out_standalone_leap, workdir)
             if returncode or errors is None or errors:
@@ -2033,6 +2205,7 @@ def main(argv=None):
                 sys.stderr.write(log[-4000:])
                 return 1
             validate_prmtop_bonds(out_standalone_prmtop, bonds)
+            validate_prmtop_impropers(out_standalone_prmtop, expected_impropers)
             sys.stderr.write("standalone tleap: Errors = {}; Warnings = {}\n"
                              .format(errors, warnings))
     except ValueError as exc:
